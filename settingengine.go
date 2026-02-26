@@ -82,6 +82,7 @@ type SettingEngine struct {
 		clientHelloMessageHook        func(handshake.MessageClientHello) handshake.Message
 		serverHelloMessageHook        func(handshake.MessageServerHello) handshake.Message
 		certificateRequestMessageHook func(handshake.MessageCertificateRequest) handshake.Message
+		factory                       DTLSFactory
 	}
 	sctp struct {
 		maxReceiveBufferSize uint32
@@ -607,6 +608,11 @@ func (e *SettingEngine) SetDTLSCipherSuites(cipherSuites ...dtls.CipherSuiteID) 
 // It allows to use custom/private DTLS CipherSuites in addition to the ones implemented by pion/dtls.
 func (e *SettingEngine) SetDTLSCustomerCipherSuites(customCipherSuites func() []dtls.CipherSuite) {
 	e.dtls.customCipherSuites = customCipherSuites
+}
+
+// SetDTLSFactory overrides the DTLS implementation used by transports.
+func (e *SettingEngine) SetDTLSFactory(factory DTLSFactory) {
+	e.dtls.factory = factory
 }
 
 // SetDTLSClientHelloMessageHook if not nil, is called when a DTLS Client Hello message is sent
