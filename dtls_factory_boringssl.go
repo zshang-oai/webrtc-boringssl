@@ -185,9 +185,8 @@ type boringSSLConn struct {
 	ctx                    *C.SSL_CTX
 	readBio                *C.BIO     // Memory BIO that receives inbound DTLS packets before SSL reads them.
 	handle                 cgo.Handle // Stable pointer-sized token used by C BIO callbacks to get back to this Go object.
+	handlePtr              unsafe.Pointer
 	closeOnce              sync.Once
-	handshake              sync.Once
-	hsErr                  error
 	mu                     sync.Mutex
 	writeMu                sync.Mutex
 	lastWriteErr           error // Captures Conn.Write failures from the BIO callback so SSL_* callers can return them.
@@ -245,7 +244,7 @@ var boringSSLSelectedSRTPProfiles = map[C.ulong]dtls.SRTPProtectionProfile{
 var bioStreamMethodOnce sync.Once
 
 func packetConnAsConn(conn net.PacketConn, remote net.Addr) net.Conn {
-	if c, ok := conn.(net.Conn); ok {
+	if c, ok := conn.(net.Conn); ok && c.RemoteAddr() != nil {
 		return c
 	}
 	return &packetConnStream{PacketConn: conn, remote: remote}
@@ -481,6 +480,7 @@ func newBoringSSLConn(conn net.Conn, cfg *dtls.Config, isClient bool) (*boringSS
 	})
 	writeBio := C.BIO_new_stream()
 	if writeBio == nil {
+		C.BIO_free(readBio)
 		C.SSL_free(ssl)
 		C.SSL_CTX_free(ctx)
 		return nil, errors.New("boringssl: failed to create write BIO")
@@ -495,7 +495,17 @@ func newBoringSSLConn(conn net.Conn, cfg *dtls.Config, isClient bool) (*boringSS
 		mtu:     mtu,
 	}
 	bc.handle = cgo.NewHandle(bc)
-	C.BIO_set_data(writeBio, unsafe.Pointer(uintptr(bc.handle)))
+	bc.handlePtr = C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0))))
+	if bc.handlePtr == nil {
+		bc.handle.Delete()
+		C.BIO_free(writeBio)
+		C.BIO_free(readBio)
+		C.SSL_free(ssl)
+		C.SSL_CTX_free(ctx)
+		return nil, errors.New("boringssl: failed to allocate BIO callback handle")
+	}
+	*(*C.uintptr_t)(bc.handlePtr) = C.uintptr_t(bc.handle)
+	C.BIO_set_data(writeBio, bc.handlePtr)
 
 	C.SSL_set_bio(ssl, readBio, writeBio)
 
@@ -513,79 +523,72 @@ func (c *boringSSLConn) Handshake() error {
 }
 
 func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
-	c.handshake.Do(func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.closed {
-			c.hsErr = io.ErrClosedPipe
-			return
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.profile != 0 {
+		return nil
+	}
+	if c.closed {
+		return io.ErrClosedPipe
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c.clearLastWriteError()
+		ret := C.SSL_do_handshake(c.ssl)
+		if ret == 1 {
+			break
 		}
 
-		for {
-			if ctx.Err() != nil {
-				c.hsErr = ctx.Err()
-				return
+		errCode := C.SSL_get_error(c.ssl, ret)
+		switch errCode {
+		case C.SSL_ERROR_WANT_READ:
+			if err := c.readRecord(ctx, readDeadlineNone); err != nil {
+				return err
 			}
-			c.clearLastWriteError()
-			ret := C.SSL_do_handshake(c.ssl)
-			if ret == 1 {
-				break
+		case C.SSL_ERROR_WANT_WRITE:
+			continue
+		case C.SSL_ERROR_ZERO_RETURN:
+			return io.EOF
+		default:
+			if err := c.takeLastWriteError(); err != nil {
+				return err
 			}
+			return errorFromBoringSSLErrors()
+		}
+	}
 
-			errCode := C.SSL_get_error(c.ssl, ret)
-			switch errCode {
-			case C.SSL_ERROR_WANT_READ:
-				if err := c.readRecord(ctx, readDeadlineNone); err != nil {
-					c.hsErr = err
-					return
-				}
-			case C.SSL_ERROR_WANT_WRITE:
-				continue
-			case C.SSL_ERROR_ZERO_RETURN:
-				c.hsErr = io.EOF
-				return
-			default:
-				if err := c.takeLastWriteError(); err != nil {
-					c.hsErr = err
-				} else {
-					c.hsErr = errorFromBoringSSLErrors()
-				}
-				return
+	if c.verify != nil {
+		var rawCerts [][]byte
+		var certPtr *C.uint8_t
+		var certLen C.size_t
+		if C.webrtc_ssl_get_peer_cert_der(c.ssl, &certPtr, &certLen) == 1 {
+			rawCerts = [][]byte{C.GoBytes(unsafe.Pointer(certPtr), C.int(certLen))}
+			C.webrtc_ssl_free(unsafe.Pointer(certPtr))
+		}
+		if len(rawCerts) > 0 {
+			// For the supported config subset, pion/dtls invokes VerifyPeerCertificate
+			// with verifiedChains=nil and only when the peer actually sent a certificate.
+			if err := c.verify(rawCerts, nil); err != nil {
+				return err
 			}
 		}
+	}
 
-		if c.verify != nil {
-			var rawCerts [][]byte
-			var certPtr *C.uint8_t
-			var certLen C.size_t
-			if C.webrtc_ssl_get_peer_cert_der(c.ssl, &certPtr, &certLen) == 1 {
-				rawCerts = [][]byte{C.GoBytes(unsafe.Pointer(certPtr), C.int(certLen))}
-				C.webrtc_ssl_free(unsafe.Pointer(certPtr))
-			}
-			if len(rawCerts) > 0 {
-				// For the supported config subset, pion/dtls invokes VerifyPeerCertificate
-				// with verifiedChains=nil and only when the peer actually sent a certificate.
-				if err := c.verify(rawCerts, nil); err != nil {
-					c.hsErr = err
-					return
-				}
-			}
-		}
+	var id C.ulong
+	if C.webrtc_ssl_get_selected_srtp_profile(c.ssl, &id) != 1 {
+		return ErrNoSRTPProtectionProfile
+	}
+	profile, ok := boringSSLSelectedSRTPProfiles[id]
+	if !ok {
+		return ErrNoSRTPProtectionProfile
+	}
+	c.profile = profile
 
-		var id C.ulong
-		if C.webrtc_ssl_get_selected_srtp_profile(c.ssl, &id) != 1 {
-			c.hsErr = ErrNoSRTPProtectionProfile
-			return
-		}
-		profile, ok := boringSSLSelectedSRTPProfiles[id]
-		if !ok {
-			c.hsErr = ErrNoSRTPProtectionProfile
-			return
-		}
-		c.profile = profile
-	})
-
-	return c.hsErr
+	return nil
 }
 
 func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlineKind) error {
@@ -687,11 +690,19 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 }
 
 func (c *boringSSLConn) KeyingMaterialExporter() (srtp.KeyingMaterialExporter, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c, c.profile != 0
 }
 
 func (c *boringSSLConn) SelectedSRTPProtectionProfile() (dtls.SRTPProtectionProfile, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.profile, c.profile != 0
+}
+
+func (c *boringSSLConn) negotiatedVersion() int {
+	return int(C.SSL_version(c.ssl))
 }
 
 func (c *boringSSLConn) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
@@ -738,6 +749,9 @@ func (c *boringSSLConn) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if err := c.Handshake(); err != nil {
+		return 0, err
+	}
 	if c.isDeadlineExceeded(readDeadlineUserRead) {
 		return 0, os.ErrDeadlineExceeded
 	}
@@ -782,6 +796,9 @@ func (c *boringSSLConn) Write(p []byte) (int, error) {
 	}
 	if c.isDeadlineExceeded(readDeadlineUserWrite) {
 		return 0, os.ErrDeadlineExceeded
+	}
+	if err := c.Handshake(); err != nil {
+		return 0, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -838,7 +855,14 @@ func (c *boringSSLConn) Close() error {
 			C.SSL_CTX_free(c.ctx)
 			c.ctx = nil
 		}
-		c.handle.Delete()
+		if c.handlePtr != nil {
+			C.free(c.handlePtr)
+			c.handlePtr = nil
+		}
+		if c.handle != 0 {
+			c.handle.Delete()
+			c.handle = 0
+		}
 	})
 
 	return closeErr
@@ -878,7 +902,10 @@ func (c *boringSSLConn) SetWriteDeadline(t time.Time) error {
 
 //export go_boringssl_write_callback
 func go_boringssl_write_callback(ctx unsafe.Pointer, buf *C.char, n C.int) C.int {
-	handle := cgo.Handle(uintptr(ctx))
+	if ctx == nil {
+		return -1
+	}
+	handle := cgo.Handle(*(*C.uintptr_t)(ctx))
 	conn, ok := handle.Value().(*boringSSLConn)
 	if !ok {
 		return -1
@@ -905,7 +932,10 @@ func go_boringssl_write_callback(ctx unsafe.Pointer, buf *C.char, n C.int) C.int
 
 //export go_boringssl_flush_callback
 func go_boringssl_flush_callback(ctx unsafe.Pointer) {
-	handle := cgo.Handle(uintptr(ctx))
+	if ctx == nil {
+		return
+	}
+	handle := cgo.Handle(*(*C.uintptr_t)(ctx))
 	conn, ok := handle.Value().(*boringSSLConn)
 	if !ok {
 		return
@@ -917,7 +947,10 @@ func go_boringssl_flush_callback(ctx unsafe.Pointer) {
 
 //export go_boringssl_query_mtu_callback
 func go_boringssl_query_mtu_callback(ctx unsafe.Pointer) C.int {
-	handle := cgo.Handle(uintptr(ctx))
+	if ctx == nil {
+		return C.int(1200)
+	}
+	handle := cgo.Handle(*(*C.uintptr_t)(ctx))
 	conn, ok := handle.Value().(*boringSSLConn)
 	if !ok || conn == nil || conn.mtu <= 0 {
 		return C.int(1200)
