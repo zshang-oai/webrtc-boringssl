@@ -47,7 +47,7 @@ type DTLSTransport struct {
 	onStateChangeHandler   func(DTLSTransportState)
 	internalOnCloseHandler func()
 
-	conn *dtls.Conn
+	conn DTLSConn
 
 	srtpSession, srtcpSession   atomic.Value
 	srtpEndpoint, srtcpEndpoint *mux.Endpoint
@@ -226,13 +226,13 @@ func (t *DTLSTransport) startSRTP() error {
 		)
 	}
 
-	connState, ok := t.conn.ConnectionState()
+	exporter, ok := t.conn.KeyingMaterialExporter()
 	if !ok {
 		// nolint
-		return fmt.Errorf("%w: Failed to get DTLS ConnectionState", errDtlsKeyExtractionFailed)
+		return fmt.Errorf("%w: Failed to get DTLS KeyingMaterialExporter", errDtlsKeyExtractionFailed)
 	}
 
-	err := srtpConfig.ExtractSessionKeysFromDTLS(&connState, t.role() == DTLSRoleClient)
+	err := srtpConfig.ExtractSessionKeysFromDTLS(exporter, t.role() == DTLSRoleClient)
 	if err != nil {
 		// nolint
 		return fmt.Errorf("%w: %v", errDtlsKeyExtractionFailed, err)
@@ -345,7 +345,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error { //nolint:
 		}, nil
 	}
 
-	var dtlsConn *dtls.Conn
+	var dtlsConn DTLSConn
 	dtlsEndpoint := t.iceTransport.newEndpoint(mux.MatchDTLS)
 	dtlsEndpoint.SetOnClose(t.internalOnCloseHandler)
 	role, dtlsConfig, err := prepareTransport()
@@ -371,7 +371,9 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error { //nolint:
 	dtlsConfig.ClientHelloMessageHook = t.api.settingEngine.dtls.clientHelloMessageHook
 	dtlsConfig.ServerHelloMessageHook = t.api.settingEngine.dtls.serverHelloMessageHook
 	dtlsConfig.CertificateRequestMessageHook = t.api.settingEngine.dtls.certificateRequestMessageHook
-	dtlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _verifiedChains [][]*x509.Certificate) error {
+	// WebRTC auth is based on the peer leaf certificate fingerprint, so this
+	// callback intentionally ignores verifiedChains.
+	dtlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
 			return errNoRemoteCertificate
 		}
@@ -394,10 +396,11 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error { //nolint:
 
 	// Connect as DTLS Client/Server, function is blocking and we
 	// must not hold the DTLSTransport lock
+	factory := getDTLSFactory(t.api.settingEngine)
 	if role == DTLSRoleClient {
-		dtlsConn, err = dtls.Client(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), dtlsConfig)
+		dtlsConn, err = factory.Client(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), dtlsConfig)
 	} else {
-		dtlsConn, err = dtls.Server(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), dtlsConfig)
+		dtlsConn, err = factory.Server(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), dtlsConfig)
 	}
 
 	if err == nil {
