@@ -198,6 +198,7 @@ type boringSSLConn struct {
 	closed                 bool
 	readDeadline           time.Time
 	writeDeadline          time.Time
+	activeWrite            bool
 	activeReadDeadlineKind readDeadlineKind // Which user operation currently owns the underlying Conn.Read deadline.
 	activeReadOpDeadline   time.Time        // Read or write deadline for the operation currently blocked on network input.
 	internalReadDeadline   time.Time        // Handshake/context/DTLS timer deadline merged into the active Conn.Read deadline.
@@ -660,7 +661,11 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 		_ = c.applyReadDeadlineLocked()
 	}()
 
-	buf := make([]byte, 2048)
+	bufSize := c.mtu
+	if bufSize < 2048 {
+		bufSize = 2048
+	}
+	buf := make([]byte, bufSize)
 	c.readMu.Lock()
 	n, err := c.Conn.Read(buf)
 	c.readMu.Unlock()
@@ -896,6 +901,9 @@ func (c *boringSSLConn) SetWriteDeadline(t time.Time) error {
 	if c.activeReadDeadlineKind == readDeadlineUserWrite {
 		c.activeReadOpDeadline = t
 	}
+	if err := c.applyWriteDeadlineLocked(); err != nil {
+		return err
+	}
 
 	return c.applyReadDeadlineLocked()
 }
@@ -922,6 +930,24 @@ func go_boringssl_write_callback(ctx unsafe.Pointer, buf *C.char, n C.int) C.int
 		conn.lastWriteErr = os.ErrDeadlineExceeded
 		return -1
 	}
+	conn.deadlineMu.Lock()
+	conn.activeWrite = true
+	if err := conn.applyWriteDeadlineLocked(); err != nil {
+		conn.activeWrite = false
+		conn.deadlineMu.Unlock()
+		conn.lastWriteErr = err
+		return -1
+	}
+	conn.deadlineMu.Unlock()
+	defer func() {
+		conn.deadlineMu.Lock()
+		defer conn.deadlineMu.Unlock()
+
+		conn.activeWrite = false
+		if conn.Conn != nil {
+			_ = conn.Conn.SetWriteDeadline(time.Time{})
+		}
+	}()
 	written, err := conn.Conn.Write(data)
 	if err != nil {
 		conn.lastWriteErr = err
@@ -983,6 +1009,14 @@ func (c *boringSSLConn) applyReadDeadlineLocked() error {
 	}
 
 	return c.Conn.SetReadDeadline(minNonZero(c.activeReadOpDeadline, c.internalReadDeadline))
+}
+
+func (c *boringSSLConn) applyWriteDeadlineLocked() error {
+	if c.Conn == nil || !c.activeWrite {
+		return nil
+	}
+
+	return c.Conn.SetWriteDeadline(c.writeDeadline)
 }
 
 func (c *boringSSLConn) isDeadlineExceeded(deadlineKind readDeadlineKind) bool {
