@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 //go:build !js
-// +build !js
 
 package webrtc
 
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	mock_interceptor "github.com/pion/interceptor/pkg/mock"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
@@ -123,7 +123,7 @@ func TestRTPReceiver_ClosedReceiveForRIDAndRTX(t *testing.T) {
 		},
 	)
 
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		track, err := receiver.receiveForRid("rid", params, ridStreamInfo, nil, nil, nil, nil, nil)
 		assert.Nil(t, track)
 		assert.ErrorIs(t, err, io.EOF)
@@ -198,7 +198,7 @@ func TestRTPReceiver_readRTX_ChannelAccessSafe(t *testing.T) {
 		},
 	)
 
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		require.NoError(t, receiver.receiveForRtx(SSRC(2222), "", repairStreamInfo, nil, rtpInterceptor, nil, nil))
 	}
 
@@ -273,7 +273,7 @@ func TestRTPReceiver_ReadRTP_SimulcastNoRace(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			_, _, err = lowTrack.Read(make([]byte, 1500))
 			require.NoError(t, err)
 		}
@@ -304,7 +304,7 @@ func TestRTPReceiver_ReadRTP_SimulcastNoRace(t *testing.T) {
 	receiver.tracks[1].track.params = params
 	receiver.tracks[1].track.mu.Unlock()
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		lowCh <- lowPkt
 	}
 	close(lowCh)
@@ -518,4 +518,131 @@ func (f *fakeAudioPlayoutStatsProvider) AddTrack(track *TrackRemote) error {
 
 func (f *fakeAudioPlayoutStatsProvider) RemoveTrack(track *TrackRemote) {
 	track.removeProvider(f)
+}
+
+func TestRTPReceiverRTXStreamInfoMimeType(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// Collect all StreamInfos bound on the remote (receiver) side
+	var (
+		boundStreamInfos []*interceptor.StreamInfo
+	)
+
+	mockInterceptor := &mock_interceptor.Interceptor{
+		BindRemoteStreamFn: func(info *interceptor.StreamInfo, reader interceptor.RTPReader) interceptor.RTPReader {
+			boundStreamInfos = append(boundStreamInfos, info)
+
+			return reader
+		},
+	}
+
+	ir := &interceptor.Registry{}
+	ir.Add(&mock_interceptor.Factory{
+		NewInterceptorFn: func(_ string) (interceptor.Interceptor, error) { return mockInterceptor, nil },
+	})
+
+	sender, receiver, err := NewAPI(WithInterceptorRegistry(ir)).newPair(Configuration{})
+	assert.NoError(t, err)
+
+	track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion")
+	assert.NoError(t, err)
+
+	_, err = sender.AddTrack(track)
+	assert.NoError(t, err)
+
+	// Signal and wait until the receiver fires OnTrack (stream is negotiated + receiving)
+	trackReceived, trackReceivedCancel := context.WithCancel(context.Background())
+	receiver.OnTrack(func(_ *TrackRemote, _ *RTPReceiver) {
+		trackReceivedCancel()
+	})
+
+	assert.NoError(t, signalPair(sender, receiver))
+
+	// Send samples until the receiver sees the track (RTX SSRC gets registered during Receive)
+	func() {
+		ticker := time.NewTicker(time.Millisecond * 20)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-trackReceived.Done():
+				return
+			case <-ticker.C:
+				assert.NoError(t, track.WriteSample(media.Sample{Data: []byte{0xAA}, Duration: time.Second}))
+			}
+		}
+	}()
+
+	// Assert: exactly one bound stream must have MimeType == MimeTypeRTX
+	count := 0
+	for _, info := range boundStreamInfos {
+		if info.MimeType == MimeTypeRTX {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count,
+		"expected exactly one RTX StreamInfo with MimeType %q, got %d (all types: %v)",
+		MimeTypeRTX, count, mimeTypes(boundStreamInfos))
+
+	closePairNow(t, sender, receiver)
+}
+
+// helper to print all mime types for debugging.
+func mimeTypes(infos []*interceptor.StreamInfo) []string {
+	out := make([]string, len(infos))
+	for i, info := range infos {
+		out[i] = info.MimeType
+	}
+
+	return out
+}
+
+// TestRTPReceiver_CollectStats_RID validates that collectStats correctly maps RID
+// from TrackRemote into InboundRTPStreamStats.
+func TestRTPReceiver_CollectStats_RID(t *testing.T) {
+	ssrc := SSRC(1234)
+
+	fg := &fakeGetter{s: stats.Stats{}}
+
+	receiver := &RTPReceiver{
+		kind: RTPCodecTypeVideo,
+		log:  logging.NewDefaultLoggerFactory().NewLogger("RTPReceiverTest"),
+	}
+
+	// Case 1: RID empty
+	tr := newTrackRemote(RTPCodecTypeVideo, ssrc, 0, "", receiver)
+	receiver.tracks = []trackStreams{{track: tr}}
+
+	collector := newStatsReportCollector()
+	receiver.collectStats(collector, fg)
+	report := collector.Ready()
+
+	statID := "inbound-rtp-1234"
+	got, ok := report[statID]
+	require.True(t, ok)
+
+	inbound, ok := got.(InboundRTPStreamStats)
+	require.True(t, ok)
+
+	assert.Equal(t, "", inbound.Rid)
+
+	// Case 2: RID present
+	rid := "f"
+	tr = newTrackRemote(RTPCodecTypeVideo, ssrc, 0, rid, receiver)
+	receiver.tracks = []trackStreams{{track: tr}}
+
+	collector = newStatsReportCollector()
+	receiver.collectStats(collector, fg)
+	report = collector.Ready()
+
+	got, ok = report[statID]
+	require.True(t, ok)
+
+	inbound, ok = got.(InboundRTPStreamStats)
+	require.True(t, ok)
+
+	assert.Equal(t, rid, inbound.Rid)
 }
