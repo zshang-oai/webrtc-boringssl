@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +89,170 @@ func TestBoringSSLFactory_InteropDTLS13(t *testing.T) {
 	assert.Equal(t, 0xfefc, serverConn.negotiatedVersion())
 }
 
+func TestBoringSSLFactory_ReadDoesNotBlockConcurrentWrite(t *testing.T) {
+	clientPacketConn := newLocalUDPConn(t)
+	serverPacketConn := &readSignalPacketConn{
+		PacketConn: newLocalUDPConn(t),
+	}
+
+	serverConfig := newInteropDTLSConfig(t)
+	serverConfig.InsecureSkipVerifyHello = true
+
+	serverReady := make(chan *boringSSLConn, 1)
+	serverHandshakeDone := make(chan error, 1)
+	go func() {
+		server, err := NewBoringSSLFactory().Server(packetConnOnly{serverPacketConn}, clientPacketConn.LocalAddr(), serverConfig)
+		if err != nil {
+			serverHandshakeDone <- err
+			return
+		}
+
+		serverConn := server.(*boringSSLConn)
+		serverReady <- serverConn
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		serverHandshakeDone <- serverConn.HandshakeContext(ctx)
+	}()
+
+	client, err := NewBoringSSLFactory().Client(
+		packetConnOnly{clientPacketConn},
+		serverPacketConn.LocalAddr(),
+		newInteropDTLSConfig(t),
+	)
+	require.NoError(t, err)
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var server *boringSSLConn
+	select {
+	case server = <-serverReady:
+	case err := <-serverHandshakeDone:
+		require.NoError(t, err)
+		require.FailNow(t, "server handshake completed before server setup was published")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for BoringSSL server setup")
+	}
+	defer func() {
+		_ = server.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, client.HandshakeContext(ctx))
+	require.NoError(t, <-serverHandshakeDone)
+
+	readStarted := serverPacketConn.signalNextRead()
+	serverReadDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := server.Read(buf)
+		serverReadDone <- err
+	}()
+
+	select {
+	case <-readStarted:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for server read to reach the underlying connection")
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := server.Write([]byte("pong"))
+		writeDone <- err
+	}()
+
+	select {
+	case err := <-writeDone:
+		require.NoError(t, err)
+	case <-time.After(500 * time.Millisecond):
+		require.FailNow(t, "server write blocked behind an idle server read")
+	}
+
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, 4)
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "pong", string(buf[:n]))
+
+	require.NoError(t, server.SetReadDeadline(time.Now()))
+	select {
+	case <-serverReadDone:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for server read to unblock")
+	}
+}
+
+func TestBoringSSLFactory_DataChannelCanSendWhileReadLoopIdle(t *testing.T) {
+	answerSettingEngine := SettingEngine{}
+	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
+	answerSettingEngine.SetDTLSInsecureSkipHelloVerify(true)
+
+	offer, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	answer, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer closePairNow(t, offer, answer)
+
+	dataChannelID := uint16(0)
+	negotiated := true
+	dataChannelOptions := &DataChannelInit{
+		ID:         &dataChannelID,
+		Negotiated: &negotiated,
+	}
+
+	offerDataChannel, err := offer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+	answerDataChannel, err := answer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+
+	offerOpened := make(chan struct{})
+	answerOpened := make(chan struct{})
+	receivedMessage := make(chan string, 1)
+	offerDataChannel.OnOpen(func() {
+		close(offerOpened)
+	})
+	answerDataChannel.OnOpen(func() {
+		close(answerOpened)
+	})
+	offerDataChannel.OnMessage(func(message DataChannelMessage) {
+		receivedMessage <- string(message.Data)
+	})
+
+	require.NoError(t, signalPairWithOptions(offer, answer, withDisableInitialDataChannel(true)))
+
+	select {
+	case <-offerOpened:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for offer data channel to open")
+	}
+	select {
+	case <-answerOpened:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for answer data channel to open")
+	}
+
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- answerDataChannel.SendText("server-state-update")
+	}()
+
+	select {
+	case err := <-sendDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "answer data channel send blocked behind its SCTP read loop")
+	}
+
+	select {
+	case message := <-receivedMessage:
+		assert.Equal(t, "server-state-update", message)
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for offer data channel message")
+	}
+}
+
 func newLocalUDPConn(t *testing.T) *net.UDPConn {
 	t.Helper()
 
@@ -102,6 +267,34 @@ func newLocalUDPConn(t *testing.T) *net.UDPConn {
 
 type packetConnOnly struct {
 	net.PacketConn
+}
+
+type readSignalPacketConn struct {
+	net.PacketConn
+	mu          sync.Mutex
+	readStarted chan struct{}
+}
+
+func (c *readSignalPacketConn) signalNextRead() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	readStarted := make(chan struct{})
+	c.readStarted = readStarted
+
+	return readStarted
+}
+
+func (c *readSignalPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.mu.Lock()
+	readStarted := c.readStarted
+	if readStarted != nil {
+		close(readStarted)
+		c.readStarted = nil
+	}
+	c.mu.Unlock()
+
+	return c.PacketConn.ReadFrom(p)
 }
 
 func newInteropDTLSConfig(t *testing.T) *dtls.Config {
