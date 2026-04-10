@@ -666,9 +666,21 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 		bufSize = 2048
 	}
 	buf := make([]byte, bufSize)
+	unlockSSLForRead := deadlineKind == readDeadlineUserRead
+	if unlockSSLForRead {
+		// Application data users, such as SCTP, expect net.Conn to be full-duplex.
+		// Do not hold the SSL state lock while waiting for the next network packet.
+		c.mu.Unlock()
+	}
 	c.readMu.Lock()
 	n, err := c.Conn.Read(buf)
 	c.readMu.Unlock()
+	if unlockSSLForRead {
+		c.mu.Lock()
+		if c.closed || c.ssl == nil || c.readBio == nil {
+			return io.ErrClosedPipe
+		}
+	}
 	if err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			if ctx.Err() != nil {
