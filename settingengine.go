@@ -118,6 +118,7 @@ type SettingEngine struct {
 	dataChannelBlockWrite                     bool
 	handleUndeclaredSSRCWithoutAnswer         bool
 	ignoreRidPauseForRecv                     bool
+	enableSped                                bool
 }
 
 type renominationSettings struct {
@@ -614,6 +615,11 @@ func (e *SettingEngine) EnableSCTPZeroChecksum(isEnabled bool) {
 // EnableSctpSnap enables the use of the SCTP SNAP connect optimization.
 func (e *SettingEngine) EnableSctpSnap(isEnabled bool) {
 	e.sctp.enableSnap = isEnabled
+}
+
+// EnableSped enables SPED/DTLS-in-STUN during connection establishment.
+func (e *SettingEngine) EnableSped(isEnabled bool) {
+	e.enableSped = isEnabled
 }
 
 // SetSCTPMaxMessageSize sets the largest message we are willing to accept.
