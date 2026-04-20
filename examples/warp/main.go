@@ -44,9 +44,12 @@ func setupOfferHandler(pc **webrtc.PeerConnection) {
 			return
 		}
 
-		// Enable SNAP.
+		// Enable SNAP and SPED.
 		s := webrtc.SettingEngine{}
 		s.EnableSctpSnap(true)
+		s.EnableSped(true)
+		s.SetDTLSFactory(webrtc.NewBoringSSLFactory())
+		s.SetDTLSInsecureSkipHelloVerify(true)
 		api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
 
 		var err error

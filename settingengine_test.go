@@ -748,11 +748,15 @@ func TestSettingEngine_SCTPSetters(t *testing.T) {
 	se.SetSCTPMinCwnd(11)
 	se.SetSCTPFastRtxWnd(22)
 	se.SetSCTPCwndCAStep(33)
+	se.EnableSctpSnap(true)
+	se.EnableSped(true)
 
 	assert.True(t, se.sctp.enableZeroChecksum)
 	assert.Equal(t, uint32(11), se.sctp.minCwnd)
 	assert.Equal(t, uint32(22), se.sctp.fastRtxWnd)
 	assert.Equal(t, uint32(33), se.sctp.cwndCAStep)
+	assert.True(t, se.sctp.enableSnap)
+	assert.True(t, se.enableSped)
 }
 
 func TestSettingEngine_HandleUndeclaredSSRCWithoutAnswer(t *testing.T) {
