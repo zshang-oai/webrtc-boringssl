@@ -1,0 +1,15 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "rtcerr",
+    srcs = ["errors.go"],
+    importpath = "github.com/pion/webrtc/v4/pkg/rtcerr",
+    importpath_aliases = ["github.com/pion/webrtc/pkg/rtcerr"],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":rtcerr",
+    visibility = ["//visibility:public"],
+)

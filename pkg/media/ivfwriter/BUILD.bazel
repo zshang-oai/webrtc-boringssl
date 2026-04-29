@@ -1,0 +1,20 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "ivfwriter",
+    srcs = ["ivfwriter.go"],
+    importpath = "github.com/pion/webrtc/v4/pkg/media/ivfwriter",
+    importpath_aliases = ["github.com/pion/webrtc/pkg/media/ivfwriter"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_pion_rtp//:rtp",
+        "@com_github_pion_rtp//codecs",
+        "@com_github_pion_rtp//codecs/av1/obu",
+    ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":ivfwriter",
+    visibility = ["//visibility:public"],
+)

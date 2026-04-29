@@ -1,0 +1,27 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "fmtp",
+    srcs = [
+        "av1.go",
+        "fmtp.go",
+        "h264.go",
+        "vp9.go",
+    ],
+    importpath = "github.com/pion/webrtc/v4/internal/fmtp",
+    importpath_aliases = ["github.com/pion/webrtc/internal/fmtp"],
+    visibility = ["//:__subpackages__"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":fmtp",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "fmtp_test",
+    srcs = ["fmtp_test.go"],
+    embed = [":fmtp"],
+    deps = ["@com_github_stretchr_testify//assert"],
+)

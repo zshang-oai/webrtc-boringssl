@@ -1,0 +1,15 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "ivfreader",
+    srcs = ["ivfreader.go"],
+    importpath = "github.com/pion/webrtc/v4/pkg/media/ivfreader",
+    importpath_aliases = ["github.com/pion/webrtc/pkg/media/ivfreader"],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":ivfreader",
+    visibility = ["//visibility:public"],
+)
