@@ -182,6 +182,7 @@ var (
 	errDetachBeforeOpened               = errors.New("datachannel not opened yet, try calling Detach from OnOpen")
 	errDtlsTransportNotStarted          = errors.New("the DTLS transport has not started yet")
 	errDtlsKeyExtractionFailed          = errors.New("failed extracting keys from DTLS for SRTP")
+	errDTLSConnectionStateUnavailable   = errors.New("failed to get DTLS connection state")
 	errFailedToStartSRTP                = errors.New("failed to start SRTP")
 	errFailedToStartSRTCP               = errors.New("failed to start SRTCP")
 	errInvalidDTLSStart                 = errors.New("attempted to start DTLSTransport that is not in new state")
