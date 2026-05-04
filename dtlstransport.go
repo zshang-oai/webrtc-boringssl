@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,13 @@ type streamsForSSRCResult struct {
 type dtlsHandshaker interface {
 	Handshake() error
 	HandshakeContext(context.Context) error
+}
+
+type dtlsPacketHookConn interface {
+	DTLSConn
+	InjectInboundPacket(packet []byte, rAddr net.Addr)
+	SetOutboundHandshakePacketInterceptor(func(packet []byte, end bool) bool)
+	SetInboundHandshakePacketNotifier(func(packet []byte))
 }
 
 // NewDTLSTransport creates a new DTLSTransport.
@@ -319,13 +327,23 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 
 	dtlsConn, err := t.connectDTLS(dtlsEndpoint, role, sharedOpts, certificate)
 	if err != nil {
+		t.clearSPED(nil)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsEndpoint.Close()
 
 		return t.failStart(err)
 	}
 
+	if err = t.configureSPED(dtlsConn); err != nil {
+		t.clearSPED(dtlsConn)
+		dtlsEndpoint.SetOnClose(nil)
+		_ = dtlsConn.Close()
+
+		return t.failStart(err)
+	}
+
 	if err = t.handshakeDTLS(dtlsConn); err != nil {
+		t.clearSPED(dtlsConn)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsConn.Close()
 
@@ -333,6 +351,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 	}
 
 	if err = t.completeStart(dtlsConn); err != nil {
+		t.clearSPED(dtlsConn)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsConn.Close()
 
@@ -340,6 +359,48 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 	}
 
 	return nil
+}
+
+func (t *DTLSTransport) configureSPED(dtlsConn DTLSConn) error {
+	if !t.api.settingEngine.enableSped {
+		return nil
+	}
+
+	hookConn, ok := dtlsConn.(dtlsPacketHookConn)
+	if !ok {
+		return errors.New("sped requires a DTLS connection with packet hooks")
+	}
+
+	hookConn.SetOutboundHandshakePacketInterceptor(func(packet []byte, end bool) bool {
+		return t.iceTransport.Piggyback(packet, end)
+	})
+	hookConn.SetInboundHandshakePacketNotifier(func(packet []byte) {
+		t.iceTransport.ReportDtlsPacket(packet)
+	})
+	t.iceTransport.SetDtlsCallback(hookConn.InjectInboundPacket)
+
+	return nil
+}
+
+func (t *DTLSTransport) finishSPED(dtlsConn DTLSConn) {
+	if !t.api.settingEngine.enableSped {
+		return
+	}
+
+	t.iceTransport.Piggyback(nil, true)
+	t.clearSPED(dtlsConn)
+}
+
+func (t *DTLSTransport) clearSPED(dtlsConn DTLSConn) {
+	if !t.api.settingEngine.enableSped {
+		return
+	}
+
+	t.iceTransport.SetDtlsCallback(nil)
+	if hookConn, ok := dtlsConn.(dtlsPacketHookConn); ok {
+		hookConn.SetOutboundHandshakePacketInterceptor(nil)
+		hookConn.SetInboundHandshakePacketNotifier(nil)
+	}
 }
 
 func (t *DTLSTransport) prepareStart(remoteParameters DTLSParameters) (DTLSRole, tls.Certificate, error) {
@@ -628,6 +689,7 @@ func (t *DTLSTransport) completeStart(dtlsConn DTLSConn) error {
 	t.srtpProtectionProfile = srtpProtectionProfile
 	t.conn = dtlsConn
 	t.onStateChange(DTLSTransportStateConnected)
+	t.finishSPED(dtlsConn)
 
 	return t.startSRTP()
 }
