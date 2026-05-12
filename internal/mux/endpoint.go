@@ -56,9 +56,7 @@ func (e *Endpoint) ReadFrom(p []byte) (int, net.Addr, error) {
 // Write writes len(p) bytes to the underlying conn.
 func (e *Endpoint) Write(p []byte) (int, error) {
 	n, err := e.mux.nextConn.Write(p)
-	if errors.Is(err, ice.ErrNoCandidatePairs) {
-		return 0, nil
-	} else if errors.Is(err, ice.ErrClosed) {
+	if errors.Is(err, ice.ErrClosed) {
 		return 0, io.ErrClosedPipe
 	}
 

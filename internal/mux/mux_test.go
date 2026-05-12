@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
 	"github.com/pion/transport/v4/packetio"
 	"github.com/pion/transport/v4/test"
@@ -120,6 +121,15 @@ type writeDeadlineErrorConn struct {
 	deadlineErr error
 }
 
+type writeErrConn struct {
+	net.Conn
+	err error
+}
+
+func (w *writeErrConn) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
 func (w *writeDeadlineErrorConn) SetDeadline(t time.Time) error {
 	if w.deadlineErr != nil {
 		return w.deadlineErr
@@ -156,6 +166,26 @@ func TestEndpointSetDeadlineWriteDeadlineError(t *testing.T) {
 	require.NoError(t, mux.Close())
 	require.NoError(t, ca.Close())
 	require.NoError(t, rdConn.Close())
+}
+
+func TestEndpointWritePropagatesErrNoCandidatePairs(t *testing.T) {
+	ca, cb := net.Pipe()
+	defer func() {
+		require.NoError(t, ca.Close())
+		require.NoError(t, cb.Close())
+	}()
+
+	mux := NewMux(Config{
+		Conn:          &writeErrConn{Conn: ca, err: ice.ErrNoCandidatePairs},
+		BufferSize:    testPipeBufferSize,
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	endpoint := mux.NewEndpoint(MatchAll)
+
+	n, err := endpoint.Write([]byte("payload"))
+	require.Zero(t, n)
+	require.ErrorIs(t, err, ice.ErrNoCandidatePairs)
+	require.NoError(t, mux.Close())
 }
 
 type muxErrorConnReadResult struct {
