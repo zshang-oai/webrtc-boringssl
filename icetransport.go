@@ -8,6 +8,7 @@ package webrtc
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,16 @@ type ICETransport struct {
 
 	loggerFactory logging.LoggerFactory
 
+	dtlsCallback       func(packet []byte, rAddr net.Addr)
+	pendingDtlsPackets []dtlsPacket
+	dtlsCallbackArmed  bool
+
 	log logging.LeveledLogger
+}
+
+type dtlsPacket struct {
+	packet []byte
+	rAddr  net.Addr
 }
 
 // GetSelectedCandidatePair returns the selected candidate pair on which packets are sent
@@ -69,7 +79,7 @@ func (t *ICETransport) GetSelectedCandidatePair() (*ICECandidatePair, error) {
 }
 
 // GetSelectedCandidatePairStats returns the selected candidate pair stats on which packets are sent
-// if there is no selected pair empty stats, false is returned to indicate stats not available.
+// if there is no selected pair, false is returned to indicate stats are not available.
 func (t *ICETransport) GetSelectedCandidatePairStats() (ICECandidatePairStats, bool) {
 	return t.gatherer.getSelectedCandidatePairStats()
 }
@@ -106,6 +116,12 @@ func (t *ICETransport) Start(gatherer *ICEGatherer, params ICEParameters, role *
 	agent := t.gatherer.getAgent()
 	if agent == nil {
 		return fmt.Errorf("%w: unable to start ICETransport", errICEAgentNotExist)
+	}
+	if t.gatherer.api.settingEngine.enableSped {
+		agent.SetDtlsCallback(t.handleDtlsPacket)
+		t.dtlsCallbackArmed = true
+	} else {
+		agent.SetDtlsCallback(t.dtlsCallback)
 	}
 
 	if err := agent.OnConnectionStateChange(func(iceState ice.ConnectionState) {
@@ -145,17 +161,28 @@ func (t *ICETransport) Start(gatherer *ICEGatherer, params ICEParameters, role *
 	var err error
 	switch *role {
 	case ICERoleControlling:
-		iceConn, err = agent.Dial(ctx,
+		iceConn, err = agent.StartDial(
 			params.UsernameFragment,
 			params.Password)
 
 	case ICERoleControlled:
-		iceConn, err = agent.Accept(ctx,
+		iceConn, err = agent.StartAccept(
 			params.UsernameFragment,
 			params.Password)
 
 	default:
 		err = errICERoleUnknown
+	}
+
+	if err != nil {
+		t.lock.Lock()
+
+		return err
+	}
+
+	if !t.gatherer.api.settingEngine.enableSped {
+		// Note: this blocks until a pair is found.
+		err = agent.AwaitConnect(ctx)
 	}
 
 	// Reacquire the lock to set the connection/mux
@@ -178,6 +205,56 @@ func (t *ICETransport) Start(gatherer *ICEGatherer, params ICEParameters, role *
 	t.mux = mux.NewMux(config)
 
 	return nil
+}
+
+func (t *ICETransport) SetDtlsCallback(cb func(packet []byte, rAddr net.Addr)) {
+	t.lock.Lock()
+
+	t.dtlsCallback = cb
+	pendingPackets := t.pendingDtlsPackets
+	if cb == nil {
+		t.pendingDtlsPackets = nil
+		pendingPackets = nil
+	} else {
+		t.pendingDtlsPackets = nil
+	}
+
+	dtlsCallbackArmed := false
+	if t.gatherer != nil {
+		if agent := t.gatherer.getAgent(); agent != nil {
+			if t.gatherer.api.settingEngine.enableSped && cb != nil {
+				if !t.dtlsCallbackArmed {
+					agent.SetDtlsCallback(t.handleDtlsPacket)
+				}
+				dtlsCallbackArmed = true
+			} else {
+				agent.SetDtlsCallback(cb)
+			}
+		}
+	}
+	t.dtlsCallbackArmed = dtlsCallbackArmed
+	t.lock.Unlock()
+
+	for _, pendingPacket := range pendingPackets {
+		cb(pendingPacket.packet, pendingPacket.rAddr)
+	}
+}
+
+func (t *ICETransport) handleDtlsPacket(packet []byte, rAddr net.Addr) {
+	t.lock.Lock()
+	cb := t.dtlsCallback
+	if cb == nil {
+		t.pendingDtlsPackets = append(t.pendingDtlsPackets, dtlsPacket{
+			packet: append([]byte(nil), packet...),
+			rAddr:  rAddr,
+		})
+		t.lock.Unlock()
+
+		return
+	}
+	t.lock.Unlock()
+
+	cb(packet, rAddr)
 }
 
 // restart is not exposed currently because ORTC has users create a whole new ICETransport
@@ -454,4 +531,32 @@ func (t *ICETransport) setRemoteCredentials(newUfrag, newPwd string) error {
 	}
 
 	return agent.SetRemoteCredentials(newUfrag, newPwd)
+}
+
+// Piggyback forwards a raw DTLS packet to the ICE Agent for STUN embedding.
+func (t *ICETransport) Piggyback(packet []byte, end bool) bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	agent := t.gatherer.getAgent()
+	if agent == nil {
+		t.log.Warnf("%w: unable to piggyback DTLS packet", errICEAgentNotExist)
+
+		return false
+	}
+
+	return agent.Piggyback(packet, end)
+}
+
+func (t *ICETransport) ReportDtlsPacket(packet []byte) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	agent := t.gatherer.getAgent()
+	if agent == nil {
+		t.log.Warnf("%w: unable to report DTLS packet", errICEAgentNotExist)
+
+		return
+	}
+	agent.ReportDtlsPacket(packet)
 }

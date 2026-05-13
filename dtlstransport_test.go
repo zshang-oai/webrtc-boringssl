@@ -177,6 +177,31 @@ func TestPeerConnection_DTLSRoleSettingEngine(t *testing.T) {
 	})
 }
 
+func TestShouldClearSPEDFinalFlight(t *testing.T) {
+	testCases := []struct {
+		name      string
+		role      DTLSRole
+		isDTLS13  bool
+		wantClear bool
+	}{
+		{name: "dtls13-client-keeps-final-flight", role: DTLSRoleClient, isDTLS13: true, wantClear: false},
+		{name: "dtls13-server-clears-final-flight", role: DTLSRoleServer, isDTLS13: true, wantClear: true},
+		{name: "dtls12-client-clears-final-flight", role: DTLSRoleClient, isDTLS13: false, wantClear: true},
+		{name: "dtls12-server-keeps-final-flight", role: DTLSRoleServer, isDTLS13: false, wantClear: false},
+		{name: "unknown-role-clears-final-flight", role: DTLSRoleUnknown, isDTLS13: true, wantClear: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(
+				t,
+				testCase.wantClear,
+				shouldClearSPEDFinalFlight(testCase.role, testCase.isDTLS13),
+			)
+		})
+	}
+}
+
 type errConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -197,6 +222,39 @@ type failingPacketConn struct {
 	localAddr net.Addr
 	readErr   error
 	writeErr  error
+}
+
+type testDTLSFactory struct {
+	conn DTLSConn
+	err  error
+}
+
+func (f testDTLSFactory) Client(net.PacketConn, net.Addr, *dtls.Config) (DTLSConn, error) {
+	return f.conn, f.err
+}
+
+func (f testDTLSFactory) Server(net.PacketConn, net.Addr, *dtls.Config) (DTLSConn, error) {
+	return f.conn, f.err
+}
+
+type noHookDTLSConn struct {
+	*errConn
+}
+
+func (c *noHookDTLSConn) Handshake() error {
+	return nil
+}
+
+func (c *noHookDTLSConn) HandshakeContext(context.Context) error {
+	return nil
+}
+
+func (c *noHookDTLSConn) KeyingMaterialExporter() (srtp.KeyingMaterialExporter, bool) {
+	return nil, false
+}
+
+func (c *noHookDTLSConn) SelectedSRTPProtectionProfile() (dtls.SRTPProtectionProfile, bool) {
+	return 0, false
 }
 
 var errTestWriteFailed = errors.New("write failed")
@@ -293,6 +351,63 @@ func TestDTLSTransport_Start_HandshakeErrorFailsTransport(t *testing.T) {
 	assert.Nil(t, transport.conn)
 
 	assert.Equal(t, 2, reflect.ValueOf(iceTransport.mux).Elem().FieldByName("endpoints").Len())
+}
+
+func TestDTLSTransport_Start_EarlyErrorsClearSPED(t *testing.T) {
+	tests := []struct {
+		name    string
+		factory DTLSFactory
+	}{
+		{
+			name:    "ConnectError",
+			factory: testDTLSFactory{err: errors.New("connect failed")},
+		},
+		{
+			name: "UnsupportedFactory",
+			factory: testDTLSFactory{
+				conn: &noHookDTLSConn{errConn: &errConn{}},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := test.TimeOut(time.Second)
+			defer lim.Stop()
+
+			se := SettingEngine{}
+			se.EnableSped(true)
+			se.SetDTLSFactory(tc.factory)
+			api := NewAPI(WithSettingEngine(se))
+			loggerFactory := api.settingEngine.LoggerFactory
+
+			gatherer, err := api.NewICEGatherer(ICEGatherOptions{})
+			assert.NoError(t, err)
+			defer func() { _ = gatherer.Close() }()
+
+			localConn, remoteConn := net.Pipe()
+			defer func() { _ = remoteConn.Close() }()
+
+			iceTransport := api.NewICETransport(gatherer)
+			iceTransport.mux = mux.NewMux(mux.Config{
+				Conn:          localConn,
+				BufferSize:    1500,
+				LoggerFactory: loggerFactory,
+			})
+			defer func() { _ = iceTransport.mux.Close() }()
+
+			iceTransport.SetDtlsCallback(iceTransport.handleDtlsPacket)
+			iceTransport.dtlsCallbackArmed = true
+
+			transport, err := api.NewDTLSTransport(iceTransport, nil)
+			assert.NoError(t, err)
+
+			err = transport.Start(DTLSParameters{Role: DTLSRoleServer})
+			assert.Error(t, err)
+			assert.False(t, iceTransport.dtlsCallbackArmed)
+			assert.Nil(t, iceTransport.dtlsCallback)
+		})
+	}
 }
 
 func TestDTLSTransport_dtlsSharedOptions_IncludesOptionalOptions(t *testing.T) {

@@ -253,6 +253,91 @@ func TestBoringSSLFactory_DataChannelCanSendWhileReadLoopIdle(t *testing.T) {
 	}
 }
 
+func TestBoringSSLFactory_SpedFallsBackWithNonSpedPeer(t *testing.T) {
+	answerSettingEngine := SettingEngine{}
+	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
+	answerSettingEngine.SetDTLSInsecureSkipHelloVerify(true)
+	answerSettingEngine.EnableSped(true)
+
+	offer, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	answer, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer closePairNow(t, offer, answer)
+
+	dataChannelID := uint16(0)
+	negotiated := true
+	dataChannelOptions := &DataChannelInit{
+		ID:         &dataChannelID,
+		Negotiated: &negotiated,
+	}
+
+	offerDataChannel, err := offer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+	answerDataChannel, err := answer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+
+	offerOpened := make(chan struct{})
+	answerOpened := make(chan struct{})
+	receivedMessage := make(chan string, 1)
+	offerDataChannel.OnOpen(func() {
+		close(offerOpened)
+	})
+	answerDataChannel.OnOpen(func() {
+		close(answerOpened)
+	})
+	offerDataChannel.OnMessage(func(message DataChannelMessage) {
+		receivedMessage <- string(message.Data)
+	})
+
+	require.NoError(t, signalPairWithOptions(offer, answer, withDisableInitialDataChannel(true)))
+
+	select {
+	case <-offerOpened:
+	case <-time.After(5 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for offer data channel to open")
+	}
+	select {
+	case <-answerOpened:
+	case <-time.After(5 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for answer data channel to open")
+	}
+
+	require.NoError(t, answerDataChannel.SendText("sped-fallback-ready"))
+
+	select {
+	case message := <-receivedMessage:
+		assert.Equal(t, "sped-fallback-ready", message)
+	case <-time.After(2 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for fallback data channel message")
+	}
+}
+
+func connectionDebugState(offer, answer *PeerConnection) string {
+	return fmt.Sprintf(
+		"offer(pc=%s ice=%s dtls=%s) answer(pc=%s ice=%s dtls=%s)",
+		offer.ConnectionState(),
+		offer.ICEConnectionState(),
+		offer.dtlsTransport.State(),
+		answer.ConnectionState(),
+		answer.ICEConnectionState(),
+		answer.dtlsTransport.State(),
+	)
+}
+
+func TestPacketConnAsConn_UnconnectedUDPConnUsesPacketConnStream(t *testing.T) {
+	conn := newLocalUDPConn(t)
+	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478}
+
+	wrapped := packetConnAsConn(conn, remote)
+	stream, ok := wrapped.(*packetConnStream)
+	require.True(t, ok)
+	assert.Equal(t, remote, stream.RemoteAddr())
+}
+
 func newLocalUDPConn(t *testing.T) *net.UDPConn {
 	t.Helper()
 
