@@ -94,6 +94,7 @@ type SettingEngine struct {
 		fastRtxWnd           uint32
 		cwndCAStep           uint32
 		enableSnap           bool
+		snapLocalInit        []byte
 	}
 	sdpMediaLevelFingerprints                 bool
 	answeringDTLSRole                         DTLSRole
@@ -615,6 +616,12 @@ func (e *SettingEngine) EnableSCTPZeroChecksum(isEnabled bool) {
 // EnableSctpSnap enables the use of the SCTP SNAP connect optimization.
 func (e *SettingEngine) EnableSctpSnap(isEnabled bool) {
 	e.sctp.enableSnap = isEnabled
+}
+
+// SetSctpSnapLocalInit seeds decoded SCTP init bytes for SCTP SNAP signaling.
+// Callers should pass decoded bytes, not the base64 SDP attribute value.
+func (e *SettingEngine) SetSctpSnapLocalInit(localInit []byte) {
+	e.sctp.snapLocalInit = append([]byte(nil), localInit...)
 }
 
 // EnableSped enables SPED/DTLS-in-STUN during connection establishment.
