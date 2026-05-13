@@ -743,19 +743,23 @@ func TestSettingEngine_DTLSSetters(t *testing.T) {
 
 func TestSettingEngine_SCTPSetters(t *testing.T) {
 	var se SettingEngine
+	snapLocalInit := []byte{1, 2, 3}
 
 	se.EnableSCTPZeroChecksum(true)
 	se.SetSCTPMinCwnd(11)
 	se.SetSCTPFastRtxWnd(22)
 	se.SetSCTPCwndCAStep(33)
 	se.EnableSctpSnap(true)
+	se.SetSctpSnapLocalInit(snapLocalInit)
 	se.EnableSped(true)
+	snapLocalInit[0] = 9
 
 	assert.True(t, se.sctp.enableZeroChecksum)
 	assert.Equal(t, uint32(11), se.sctp.minCwnd)
 	assert.Equal(t, uint32(22), se.sctp.fastRtxWnd)
 	assert.Equal(t, uint32(33), se.sctp.cwndCAStep)
 	assert.True(t, se.sctp.enableSnap)
+	assert.Equal(t, []byte{1, 2, 3}, se.sctp.snapLocalInit)
 	assert.True(t, se.enableSped)
 }
 
