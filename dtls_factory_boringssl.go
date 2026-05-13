@@ -820,6 +820,10 @@ func (c *boringSSLConn) negotiatedVersion() int {
 	return int(C.SSL_version(c.ssl))
 }
 
+func (c *boringSSLConn) isDTLS13() bool {
+	return C.SSL_version(c.ssl) == C.DTLS1_3_VERSION
+}
+
 func (c *boringSSLConn) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
 	if length <= 0 {
 		return nil, errors.New("boringssl: invalid keying material length")

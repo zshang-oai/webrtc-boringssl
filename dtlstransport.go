@@ -388,7 +388,9 @@ func (t *DTLSTransport) finishSPED(dtlsConn DTLSConn) {
 	}
 
 	t.iceTransport.Piggyback(nil, true)
-	t.clearSPED(dtlsConn)
+	if t.shouldClearSPEDFinalFlight(dtlsConn) {
+		t.clearSPED(dtlsConn)
+	}
 }
 
 func (t *DTLSTransport) clearSPED(dtlsConn DTLSConn) {
@@ -400,6 +402,30 @@ func (t *DTLSTransport) clearSPED(dtlsConn DTLSConn) {
 	if hookConn, ok := dtlsConn.(dtlsPacketHookConn); ok {
 		hookConn.SetOutboundHandshakePacketInterceptor(nil)
 		hookConn.SetInboundHandshakePacketNotifier(nil)
+	}
+}
+
+type dtls13VersionConn interface {
+	isDTLS13() bool
+}
+
+func (t *DTLSTransport) shouldClearSPEDFinalFlight(dtlsConn DTLSConn) bool {
+	versionConn, ok := dtlsConn.(dtls13VersionConn)
+	if !ok {
+		return true
+	}
+
+	return shouldClearSPEDFinalFlight(t.role(), versionConn.isDTLS13())
+}
+
+func shouldClearSPEDFinalFlight(role DTLSRole, isDTLS13 bool) bool {
+	switch role {
+	case DTLSRoleClient:
+		return !isDTLS13
+	case DTLSRoleServer:
+		return isDTLS13
+	default:
+		return true
 	}
 }
 

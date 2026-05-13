@@ -177,6 +177,31 @@ func TestPeerConnection_DTLSRoleSettingEngine(t *testing.T) {
 	})
 }
 
+func TestShouldClearSPEDFinalFlight(t *testing.T) {
+	testCases := []struct {
+		name      string
+		role      DTLSRole
+		isDTLS13  bool
+		wantClear bool
+	}{
+		{name: "dtls13-client-keeps-final-flight", role: DTLSRoleClient, isDTLS13: true, wantClear: false},
+		{name: "dtls13-server-clears-final-flight", role: DTLSRoleServer, isDTLS13: true, wantClear: true},
+		{name: "dtls12-client-clears-final-flight", role: DTLSRoleClient, isDTLS13: false, wantClear: true},
+		{name: "dtls12-server-keeps-final-flight", role: DTLSRoleServer, isDTLS13: false, wantClear: false},
+		{name: "unknown-role-clears-final-flight", role: DTLSRoleUnknown, isDTLS13: true, wantClear: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(
+				t,
+				testCase.wantClear,
+				shouldClearSPEDFinalFlight(testCase.role, testCase.isDTLS13),
+			)
+		})
+	}
+}
+
 type errConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
