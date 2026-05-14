@@ -87,6 +87,7 @@ type PeerConnection struct {
 	iceTransport  *ICETransport
 	dtlsTransport *DTLSTransport
 	sctpTransport *SCTPTransport
+	pendingSCTP   *pendingSCTPStart
 
 	// A reference to the associated API state used by this connection
 	api *API
@@ -94,6 +95,11 @@ type PeerConnection struct {
 
 	interceptorRTCPWriter interceptor.RTCPWriter
 	statsGetter           stats.Getter
+}
+
+type pendingSCTPStart struct {
+	maxMessageSize uint32
+	remoteSctpInit []byte
 }
 
 // NewPeerConnection creates a PeerConnection with the default codecs and interceptors.
@@ -901,6 +907,12 @@ func (pc *PeerConnection) createICETransport() *ICETransport {
 			return
 		}
 		pc.onICEConnectionStateChange(cs)
+		if pc.api.settingEngine.enableSped &&
+			(cs == ICEConnectionStateConnected || cs == ICEConnectionStateCompleted) {
+			pc.ops.Enqueue(func() {
+				pc.startPendingSCTPIfReady()
+			})
+		}
 		pc.updateConnectionState(cs, pc.dtlsTransport.State())
 	})
 
@@ -1677,6 +1689,38 @@ func (pc *PeerConnection) startSCTP(maxMessageSize uint32, remoteSctpInit []byte
 		}
 
 		return
+	}
+}
+
+func (pc *PeerConnection) startSCTPWhenReady(maxMessageSize uint32, remoteSctpInit []byte) {
+	if pc.api.settingEngine.enableSped && !pc.canStartSCTP() {
+		pc.pendingSCTP = &pendingSCTPStart{
+			maxMessageSize: maxMessageSize,
+			remoteSctpInit: append([]byte(nil), remoteSctpInit...),
+		}
+
+		return
+	}
+
+	pc.startSCTP(maxMessageSize, remoteSctpInit)
+}
+
+func (pc *PeerConnection) startPendingSCTPIfReady() {
+	if pc.pendingSCTP == nil || !pc.canStartSCTP() {
+		return
+	}
+
+	pending := pc.pendingSCTP
+	pc.pendingSCTP = nil
+	pc.startSCTP(pending.maxMessageSize, pending.remoteSctpInit)
+}
+
+func (pc *PeerConnection) canStartSCTP() bool {
+	switch pc.ICEConnectionState() {
+	case ICEConnectionStateConnected, ICEConnectionStateCompleted:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2845,7 +2889,7 @@ func (pc *PeerConnection) startRTP(
 		// RFC 8843 Section 6 permits bundle-only media sections to use port zero.
 		if _, bundleOnly := d.Attribute("bundle-only"); d.MediaName.Port.Value != 0 || bundleOnly {
 			remoteSctpInit, _ := getSctpInit(d)
-			pc.startSCTP(getMaxMessageSize(d), remoteSctpInit)
+			pc.startSCTPWhenReady(getMaxMessageSize(d), remoteSctpInit)
 		}
 	}
 }
