@@ -40,16 +40,11 @@ type ICETransport struct {
 
 	loggerFactory logging.LoggerFactory
 
-	dtlsCallback       func(packet []byte, rAddr net.Addr)
-	pendingDtlsPackets []dtlsPacket
-	dtlsCallbackArmed  bool
+	dtlsCallback      func(packet []byte, rAddr net.Addr)
+	dtlsCallbackCond  *sync.Cond
+	dtlsCallbackArmed bool
 
 	log logging.LeveledLogger
-}
-
-type dtlsPacket struct {
-	packet []byte
-	rAddr  net.Addr
 }
 
 // GetSelectedCandidatePair returns the selected candidate pair on which packets are sent
@@ -91,6 +86,7 @@ func NewICETransport(gatherer *ICEGatherer, loggerFactory logging.LoggerFactory)
 		loggerFactory: loggerFactory,
 		log:           loggerFactory.NewLogger("ortc"),
 	}
+	iceTransport.dtlsCallbackCond = sync.NewCond(&iceTransport.lock)
 	iceTransport.setState(ICETransportStateNew)
 
 	return iceTransport
@@ -211,13 +207,6 @@ func (t *ICETransport) SetDtlsCallback(cb func(packet []byte, rAddr net.Addr)) {
 	t.lock.Lock()
 
 	t.dtlsCallback = cb
-	pendingPackets := t.pendingDtlsPackets
-	if cb == nil {
-		t.pendingDtlsPackets = nil
-		pendingPackets = nil
-	} else {
-		t.pendingDtlsPackets = nil
-	}
 
 	dtlsCallbackArmed := false
 	if t.gatherer != nil {
@@ -233,28 +222,30 @@ func (t *ICETransport) SetDtlsCallback(cb func(packet []byte, rAddr net.Addr)) {
 		}
 	}
 	t.dtlsCallbackArmed = dtlsCallbackArmed
+	t.dtlsCallbackCond.Broadcast()
 	t.lock.Unlock()
+}
 
-	for _, pendingPacket := range pendingPackets {
-		cb(pendingPacket.packet, pendingPacket.rAddr)
-	}
+// CanWrite reports whether the ICE transport can write application data through
+// either its selected pair or its best valid pair.
+func (t *ICETransport) CanWrite() bool {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+
+	return t.conn != nil && t.conn.CanWrite()
 }
 
 func (t *ICETransport) handleDtlsPacket(packet []byte, rAddr net.Addr) {
 	t.lock.Lock()
-	cb := t.dtlsCallback
-	if cb == nil {
-		t.pendingDtlsPackets = append(t.pendingDtlsPackets, dtlsPacket{
-			packet: append([]byte(nil), packet...),
-			rAddr:  rAddr,
-		})
-		t.lock.Unlock()
-
-		return
+	for t.dtlsCallback == nil && t.dtlsCallbackArmed {
+		t.dtlsCallbackCond.Wait()
 	}
+	cb := t.dtlsCallback
 	t.lock.Unlock()
 
-	cb(packet, rAddr)
+	if cb != nil {
+		cb(packet, rAddr)
+	}
 }
 
 // restart is not exposed currently because ORTC has users create a whole new ICETransport
