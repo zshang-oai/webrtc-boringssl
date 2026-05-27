@@ -184,6 +184,64 @@ func TestBoringSSLFactory_ReadDoesNotBlockConcurrentWrite(t *testing.T) {
 	}
 }
 
+func TestBoringSSLFactory_HandshakeCompletionReleasesQueuedInjectedPacket(t *testing.T) {
+	conn := &boringSSLConn{
+		injectedPackets: make(chan injectedPacket, 1),
+	}
+	injectDone := make(chan error, 1)
+	go func() {
+		injectDone <- conn.InjectInboundPacket([]byte("embedded-final-flight"), nil)
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(conn.injectedPackets) == 1
+	}, time.Second, time.Millisecond)
+
+	// An ordinary DTLS record can complete the handshake while ICE is
+	// synchronously waiting for an embedded retransmission to be processed.
+	conn.finishHandshake(nil)
+
+	select {
+	case err := <-injectDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "queued injected packet was not released after handshake completion")
+	}
+
+	_, ok := conn.takeInjectedPacket()
+	require.False(t, ok)
+}
+
+func TestBoringSSLFactory_HandshakeCompletionRacingWithInjectionDoesNotBlock(t *testing.T) {
+	for range 100 {
+		conn := &boringSSLConn{
+			injectedPackets: make(chan injectedPacket, 1),
+		}
+		start := make(chan struct{})
+		injectDone := make(chan error, 1)
+		handshakeDone := make(chan struct{})
+
+		go func() {
+			<-start
+			injectDone <- conn.InjectInboundPacket([]byte("embedded-final-flight"), nil)
+		}()
+		go func() {
+			<-start
+			conn.finishHandshake(nil)
+			close(handshakeDone)
+		}()
+		close(start)
+
+		select {
+		case err := <-injectDone:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "injected packet raced past terminal handshake cleanup")
+		}
+		<-handshakeDone
+	}
+}
+
 func TestBoringSSLFactory_DataChannelCanSendWhileReadLoopIdle(t *testing.T) {
 	answerSettingEngine := SettingEngine{}
 	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())

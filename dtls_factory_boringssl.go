@@ -191,8 +191,11 @@ type boringSSLConn struct {
 	mu                     sync.Mutex
 	writeMu                sync.Mutex
 	packetHookMu           sync.RWMutex
-	lastWriteErr           error // Captures Conn.Write failures from the BIO callback so SSL_* callers can return them.
+	lastWriteErr           error      // Captures Conn.Write failures from the BIO callback so SSL_* callers can return them.
+	injectedMu             sync.Mutex // Serializes waiter enqueue with terminal handshake cleanup.
 	injectedPackets        chan injectedPacket
+	handshakeDone          bool
+	handshakeErr           error
 	handshakeComplete      atomic.Bool
 	outboundHandshakeHook  func(packet []byte, end bool) bool
 	inboundHandshakeNotify func(packet []byte)
@@ -540,14 +543,25 @@ func (c *boringSSLConn) InjectInboundPacket(packet []byte, _ net.Addr) error {
 	if len(packet) == 0 {
 		return nil
 	}
-	if c.handshakeComplete.Load() {
-		return c.enqueueInjectedPacket(packet, nil)
+
+	c.injectedMu.Lock()
+	if c.handshakeDone {
+		err := c.handshakeErr
+		if err == nil {
+			err = c.enqueueInjectedPacket(packet, nil)
+		}
+		c.injectedMu.Unlock()
+
+		return err
 	}
 
 	processed := make(chan error, 1)
 	if err := c.enqueueInjectedPacket(packet, processed); err != nil {
+		c.injectedMu.Unlock()
+
 		return err
 	}
+	c.injectedMu.Unlock()
 
 	return <-processed
 }
@@ -600,7 +614,7 @@ func (c *boringSSLConn) Handshake() error {
 	return c.HandshakeContext(context.Background())
 }
 
-func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
+func (c *boringSSLConn) HandshakeContext(ctx context.Context) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -612,6 +626,13 @@ func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
 	}
 
 	var pendingInjectedPacket chan error
+	defer func() {
+		if err != nil {
+			finishInjectedPacket(&pendingInjectedPacket, err)
+			c.finishHandshake(err)
+		}
+	}()
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -676,7 +697,7 @@ func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
 		return ErrNoSRTPProtectionProfile
 	}
 	c.profile = profile
-	c.handshakeComplete.Store(true)
+	c.finishHandshake(nil)
 
 	return nil
 }
@@ -846,6 +867,28 @@ func (p injectedPacket) finish(err error) {
 
 	p.processed <- err
 	close(p.processed)
+}
+
+func (c *boringSSLConn) finishHandshake(err error) {
+	c.injectedMu.Lock()
+	defer c.injectedMu.Unlock()
+
+	c.handshakeDone = true
+	c.handshakeErr = err
+	if err == nil {
+		c.handshakeComplete.Store(true)
+	}
+
+	for {
+		packet, ok := c.takeInjectedPacket()
+		if !ok {
+			return
+		}
+
+		// Another DTLS input may have ended the handshake before this embedded
+		// packet was consumed. It can no longer require an SSL step.
+		packet.finish(err)
+	}
 }
 
 func (c *boringSSLConn) writeReadBIO(packet []byte) error {
@@ -1034,6 +1077,7 @@ func (c *boringSSLConn) Close() error {
 		defer c.mu.Unlock()
 
 		c.closed = true
+		c.finishHandshake(io.ErrClosedPipe)
 		if c.ssl != nil {
 			C.SSL_free(c.ssl)
 			c.ssl = nil
