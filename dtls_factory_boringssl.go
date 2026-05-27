@@ -191,8 +191,11 @@ type boringSSLConn struct {
 	mu                     sync.Mutex
 	writeMu                sync.Mutex
 	packetHookMu           sync.RWMutex
-	lastWriteErr           error // Captures Conn.Write failures from the BIO callback so SSL_* callers can return them.
-	injectedPackets        chan []byte
+	lastWriteErr           error      // Captures Conn.Write failures from the BIO callback so SSL_* callers can return them.
+	injectedMu             sync.Mutex // Serializes waiter enqueue with terminal handshake cleanup.
+	injectedPackets        chan injectedPacket
+	handshakeDone          bool
+	handshakeErr           error
 	handshakeComplete      atomic.Bool
 	outboundHandshakeHook  func(packet []byte, end bool) bool
 	inboundHandshakeNotify func(packet []byte)
@@ -210,6 +213,11 @@ type boringSSLConn struct {
 	activeReadOpDeadline   time.Time // Read or write deadline for the operation currently blocked on network input.
 	internalReadDeadline   time.Time // Handshake/context/DTLS timer deadline merged into the active Conn.Read deadline.
 	readDeadlineSeq        uint64    // Generation counter for racing deadline updates while a read wait is in flight.
+}
+
+type injectedPacket struct {
+	packet    []byte
+	processed chan error
 }
 
 type packetConnStream struct {
@@ -505,7 +513,7 @@ func newBoringSSLConn(conn net.Conn, cfg *dtls.Config, isClient bool) (*boringSS
 		readBio:         readBio,
 		verify:          cfg.VerifyPeerCertificate,
 		mtu:             mtu,
-		injectedPackets: make(chan []byte, 64),
+		injectedPackets: make(chan injectedPacket, 64),
 	}
 	bc.handle = cgo.NewHandle(bc)
 	bc.handlePtr = C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0))))
@@ -531,26 +539,61 @@ func newBoringSSLConn(conn net.Conn, cfg *dtls.Config, isClient bool) (*boringSS
 	return bc, nil
 }
 
-func (c *boringSSLConn) InjectInboundPacket(packet []byte, _ net.Addr) {
+func (c *boringSSLConn) InjectInboundPacket(packet []byte, _ net.Addr) error {
 	if len(packet) == 0 {
-		return
+		return nil
 	}
 
-	copied := append([]byte(nil), packet...)
+	c.injectedMu.Lock()
+	if c.handshakeDone {
+		err := c.handshakeErr
+		if err == nil {
+			err = c.enqueueInjectedPacket(packet, nil)
+		}
+		c.injectedMu.Unlock()
+
+		return err
+	}
+
+	processed := make(chan error, 1)
+	if err := c.enqueueInjectedPacket(packet, processed); err != nil {
+		c.injectedMu.Unlock()
+
+		return err
+	}
+	c.injectedMu.Unlock()
+
+	return <-processed
+}
+
+func (c *boringSSLConn) enqueueInjectedPacket(packet []byte, processed chan error) error {
+	if len(packet) == 0 {
+		return nil
+	}
+
+	injected := injectedPacket{
+		packet:    append([]byte(nil), packet...),
+		processed: processed,
+	}
 	select {
-	case c.injectedPackets <- copied:
+	case c.injectedPackets <- injected:
 	default:
 		select {
-		case <-c.injectedPackets:
+		case dropped := <-c.injectedPackets:
+			dropped.finish(errors.New("boringssl: dropped injected packet"))
 		default:
 		}
 		select {
-		case c.injectedPackets <- copied:
+		case c.injectedPackets <- injected:
 		default:
-			return
+			injected.finish(errors.New("boringssl: injected packet queue full"))
+
+			return errors.New("boringssl: injected packet queue full")
 		}
 	}
 	c.interruptActiveRead()
+
+	return nil
 }
 
 func (c *boringSSLConn) SetOutboundHandshakePacketInterceptor(hook func(packet []byte, end bool) bool) {
@@ -571,7 +614,7 @@ func (c *boringSSLConn) Handshake() error {
 	return c.HandshakeContext(context.Background())
 }
 
-func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
+func (c *boringSSLConn) HandshakeContext(ctx context.Context) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -582,6 +625,14 @@ func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
 		return io.ErrClosedPipe
 	}
 
+	var pendingInjectedPacket chan error
+	defer func() {
+		if err != nil {
+			finishInjectedPacket(&pendingInjectedPacket, err)
+			c.finishHandshake(err)
+		}
+	}()
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -589,24 +640,34 @@ func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
 		c.clearLastWriteError()
 		ret := C.SSL_do_handshake(c.ssl)
 		if ret == 1 {
+			finishInjectedPacket(&pendingInjectedPacket, nil)
 			break
 		}
 
 		errCode := C.SSL_get_error(c.ssl, ret)
 		switch errCode {
 		case C.SSL_ERROR_WANT_READ:
-			if err := c.readRecord(ctx, readDeadlineNone); err != nil {
+			finishInjectedPacket(&pendingInjectedPacket, nil)
+			var err error
+			pendingInjectedPacket, err = c.readRecord(ctx, readDeadlineNone)
+			if err != nil {
 				return err
 			}
 		case C.SSL_ERROR_WANT_WRITE:
+			finishInjectedPacket(&pendingInjectedPacket, nil)
 			continue
 		case C.SSL_ERROR_ZERO_RETURN:
+			finishInjectedPacket(&pendingInjectedPacket, io.EOF)
 			return io.EOF
 		default:
 			if err := c.takeLastWriteError(); err != nil {
+				finishInjectedPacket(&pendingInjectedPacket, err)
 				return err
 			}
-			return errorFromBoringSSLErrors()
+			err := errorFromBoringSSLErrors()
+			finishInjectedPacket(&pendingInjectedPacket, err)
+
+			return err
 		}
 	}
 
@@ -636,14 +697,14 @@ func (c *boringSSLConn) HandshakeContext(ctx context.Context) error {
 		return ErrNoSRTPProtectionProfile
 	}
 	c.profile = profile
-	c.handshakeComplete.Store(true)
+	c.finishHandshake(nil)
 
 	return nil
 }
 
-func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlineKind) error {
+func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlineKind) (chan error, error) {
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 
 	var opDeadline time.Time
@@ -656,7 +717,7 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 	}
 	c.deadlineMu.Unlock()
 	if deadlineExceeded(opDeadline) {
-		return os.ErrDeadlineExceeded
+		return nil, os.ErrDeadlineExceeded
 	}
 
 	var tv C.struct_timeval
@@ -717,7 +778,7 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 	}
 	buf := make([]byte, bufSize)
 	if packet, ok := c.takeInjectedPacket(); ok {
-		return c.writeReadBIO(packet)
+		return c.writeInjectedPacket(packet)
 	}
 
 	unlockSSLForRead := deadlineKind == readDeadlineUserRead
@@ -740,43 +801,93 @@ func (c *boringSSLConn) readRecord(ctx context.Context, deadlineKind readDeadlin
 	if unlockSSLForRead {
 		c.mu.Lock()
 		if c.closed || c.ssl == nil || c.readBio == nil {
-			return io.ErrClosedPipe
+			return nil, io.ErrClosedPipe
 		}
 	}
 	if err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			if packet, injected := c.takeInjectedPacket(); injected {
-				return c.writeReadBIO(packet)
+				return c.writeInjectedPacket(packet)
 			}
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return nil, ctx.Err()
 			}
 			if c.isDeadlineExceeded(deadlineKind) {
-				return os.ErrDeadlineExceeded
+				return nil, os.ErrDeadlineExceeded
 			}
 			if timeoutIsDTLS {
 				C.DTLSv1_handle_timeout(c.ssl)
-				return nil
+				return nil, nil
 			}
 		}
-		return err
+		return nil, err
 	}
 
 	if n > 0 {
 		c.notifyInboundHandshakePacket(buf[:n])
 
-		return c.writeReadBIO(buf[:n])
+		return nil, c.writeReadBIO(buf[:n])
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (c *boringSSLConn) takeInjectedPacket() ([]byte, bool) {
+func (c *boringSSLConn) takeInjectedPacket() (injectedPacket, bool) {
 	select {
 	case packet := <-c.injectedPackets:
 		return packet, true
 	default:
-		return nil, false
+		return injectedPacket{}, false
+	}
+}
+
+func (c *boringSSLConn) writeInjectedPacket(packet injectedPacket) (chan error, error) {
+	if err := c.writeReadBIO(packet.packet); err != nil {
+		packet.finish(err)
+
+		return nil, err
+	}
+
+	return packet.processed, nil
+}
+
+func finishInjectedPacket(processed *chan error, err error) {
+	if *processed == nil {
+		return
+	}
+
+	injectedPacket{processed: *processed}.finish(err)
+	*processed = nil
+}
+
+func (p injectedPacket) finish(err error) {
+	if p.processed == nil {
+		return
+	}
+
+	p.processed <- err
+	close(p.processed)
+}
+
+func (c *boringSSLConn) finishHandshake(err error) {
+	c.injectedMu.Lock()
+	defer c.injectedMu.Unlock()
+
+	c.handshakeDone = true
+	c.handshakeErr = err
+	if err == nil {
+		c.handshakeComplete.Store(true)
+	}
+
+	for {
+		packet, ok := c.takeInjectedPacket()
+		if !ok {
+			return
+		}
+
+		// Another DTLS input may have ended the handshake before this embedded
+		// packet was consumed. It can no longer require an SSL step.
+		packet.finish(err)
 	}
 }
 
@@ -893,7 +1004,7 @@ func (c *boringSSLConn) Read(p []byte) (int, error) {
 		errCode := C.SSL_get_error(c.ssl, n)
 		switch errCode {
 		case C.SSL_ERROR_WANT_READ:
-			if err := c.readRecord(context.Background(), readDeadlineUserRead); err != nil {
+			if _, err := c.readRecord(context.Background(), readDeadlineUserRead); err != nil {
 				return 0, err
 			}
 		case C.SSL_ERROR_WANT_WRITE:
@@ -938,7 +1049,7 @@ func (c *boringSSLConn) Write(p []byte) (int, error) {
 		errCode := C.SSL_get_error(c.ssl, n)
 		switch errCode {
 		case C.SSL_ERROR_WANT_READ:
-			if err := c.readRecord(context.Background(), readDeadlineUserWrite); err != nil {
+			if _, err := c.readRecord(context.Background(), readDeadlineUserWrite); err != nil {
 				return 0, err
 			}
 		case C.SSL_ERROR_WANT_WRITE:
@@ -966,6 +1077,7 @@ func (c *boringSSLConn) Close() error {
 		defer c.mu.Unlock()
 
 		c.closed = true
+		c.finishHandshake(io.ErrClosedPipe)
 		if c.ssl != nil {
 			C.SSL_free(c.ssl)
 			c.ssl = nil

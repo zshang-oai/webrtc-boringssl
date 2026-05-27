@@ -1716,12 +1716,17 @@ func (pc *PeerConnection) startPendingSCTPIfReady() {
 }
 
 func (pc *PeerConnection) canStartSCTP() bool {
-	switch pc.ICEConnectionState() {
-	case ICEConnectionStateConnected, ICEConnectionStateCompleted:
-		return true
-	default:
-		return false
+	if !pc.api.settingEngine.enableSped {
+		switch pc.ICEConnectionState() {
+		case ICEConnectionStateConnected, ICEConnectionStateCompleted:
+			return true
+		default:
+			return false
+		}
 	}
+
+	return pc.dtlsTransport.State() == DTLSTransportStateConnected &&
+		pc.iceTransport.CanWrite()
 }
 
 func (pc *PeerConnection) handleUndeclaredSSRC(
@@ -2871,6 +2876,12 @@ func (pc *PeerConnection) startTransports(
 		pc.log.Warnf("Failed to start manager: %s", err)
 
 		return
+	}
+
+	if pc.api.settingEngine.enableSped {
+		pc.ops.Enqueue(func() {
+			pc.startPendingSCTPIfReady()
+		})
 	}
 }
 

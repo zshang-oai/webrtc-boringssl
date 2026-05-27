@@ -2013,6 +2013,23 @@ func TestPeerConnectionStartSCTPWhenReadyDoesNotDeferWithoutSped(t *testing.T) {
 	require.Nil(t, pc.pendingSCTP)
 }
 
+func TestPeerConnectionCanStartSCTPUsesLegacyICEStateWithoutSped(t *testing.T) {
+	pc, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, pc.Close())
+	}()
+
+	pc.onICEConnectionStateChange(ICEConnectionStateChecking)
+	require.False(t, pc.canStartSCTP())
+
+	pc.onICEConnectionStateChange(ICEConnectionStateConnected)
+	require.True(t, pc.canStartSCTP())
+
+	pc.onICEConnectionStateChange(ICEConnectionStateCompleted)
+	require.True(t, pc.canStartSCTP())
+}
+
 func TestPeerConnectionDeadlock(t *testing.T) {
 	lim := test.TimeOut(time.Second * 5)
 	defer lim.Stop()

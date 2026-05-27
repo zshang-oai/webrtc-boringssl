@@ -80,7 +80,7 @@ type dtlsHandshaker interface {
 
 type dtlsPacketHookConn interface {
 	DTLSConn
-	InjectInboundPacket(packet []byte, rAddr net.Addr)
+	InjectInboundPacket(packet []byte, rAddr net.Addr) error
 	SetOutboundHandshakePacketInterceptor(func(packet []byte, end bool) bool)
 	SetInboundHandshakePacketNotifier(func(packet []byte))
 }
@@ -377,7 +377,11 @@ func (t *DTLSTransport) configureSPED(dtlsConn DTLSConn) error {
 	hookConn.SetInboundHandshakePacketNotifier(func(packet []byte) {
 		t.iceTransport.ReportDtlsPacket(packet)
 	})
-	t.iceTransport.SetDtlsCallback(hookConn.InjectInboundPacket)
+	t.iceTransport.SetDtlsCallback(func(packet []byte, rAddr net.Addr) {
+		if err := hookConn.InjectInboundPacket(packet, rAddr); err != nil {
+			t.log.Warnf("failed to inject SPED DTLS packet: %s", err)
+		}
+	})
 
 	return nil
 }
