@@ -85,6 +85,16 @@ type dtlsPacketHookConn interface {
 	SetInboundHandshakePacketNotifier(func(packet []byte))
 }
 
+// dtlsCloseNotifyHandlerSetter is implemented by DTLS connections that need
+// an explicit hook to surface a peer close_notify to the PeerConnection.
+//
+// pion/dtls closes its underlying mux endpoint when its background reader sees
+// close_notify. Factories that own their own DTLS reader need to preserve that
+// behavior themselves.
+type dtlsCloseNotifyHandlerSetter interface {
+	setCloseNotifyHandler(func())
+}
+
 // NewDTLSTransport creates a new DTLSTransport.
 // This constructor is part of the ORTC API. It is not
 // meant to be used together with the basic WebRTC API.
@@ -332,6 +342,9 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 		_ = dtlsEndpoint.Close()
 
 		return t.failStart(err)
+	}
+	if closeNotifyConn, ok := dtlsConn.(dtlsCloseNotifyHandlerSetter); ok {
+		closeNotifyConn.setCloseNotifyHandler(t.internalOnCloseHandler)
 	}
 
 	if err = t.configureSPED(dtlsConn); err != nil {

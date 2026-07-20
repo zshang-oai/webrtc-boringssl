@@ -197,6 +197,9 @@ type boringSSLConn struct {
 	handshakeDone          bool
 	handshakeErr           error
 	handshakeComplete      atomic.Bool
+	closeNotifyMu          sync.RWMutex
+	closeNotifyHandler     func()
+	closeNotifyOnce        sync.Once
 	outboundHandshakeHook  func(packet []byte, end bool) bool
 	inboundHandshakeNotify func(packet []byte)
 	readMu                 sync.Mutex
@@ -610,6 +613,12 @@ func (c *boringSSLConn) SetInboundHandshakePacketNotifier(notify func(packet []b
 	c.inboundHandshakeNotify = notify
 }
 
+func (c *boringSSLConn) setCloseNotifyHandler(handler func()) {
+	c.closeNotifyMu.Lock()
+	c.closeNotifyHandler = handler
+	c.closeNotifyMu.Unlock()
+}
+
 func (c *boringSSLConn) Handshake() error {
 	return c.HandshakeContext(context.Background())
 }
@@ -1010,6 +1019,7 @@ func (c *boringSSLConn) Read(p []byte) (int, error) {
 		case C.SSL_ERROR_WANT_WRITE:
 			continue
 		case C.SSL_ERROR_ZERO_RETURN:
+			c.notifyCloseNotify()
 			return 0, io.EOF
 		default:
 			if err := c.takeLastWriteError(); err != nil {
@@ -1018,6 +1028,17 @@ func (c *boringSSLConn) Read(p []byte) (int, error) {
 			return 0, errorFromBoringSSLErrors()
 		}
 	}
+}
+
+func (c *boringSSLConn) notifyCloseNotify() {
+	c.closeNotifyOnce.Do(func() {
+		c.closeNotifyMu.RLock()
+		handler := c.closeNotifyHandler
+		c.closeNotifyMu.RUnlock()
+		if handler != nil {
+			handler()
+		}
+	})
 }
 
 func (c *boringSSLConn) Write(p []byte) (int, error) {

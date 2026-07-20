@@ -311,6 +311,43 @@ func TestBoringSSLFactory_DataChannelCanSendWhileReadLoopIdle(t *testing.T) {
 	}
 }
 
+func TestBoringSSLFactory_CloseNotifyClosesPeerConnectionWithDataChannel(t *testing.T) {
+	answerSettingEngine := SettingEngine{}
+	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
+	answerSettingEngine.SetDTLSInsecureSkipHelloVerify(true)
+
+	offer, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	answer, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = offer.Close()
+		_ = answer.Close()
+	})
+
+	dataChannel, err := offer.CreateDataChannel("control", nil)
+	require.NoError(t, err)
+	dataChannelOpened := make(chan struct{})
+	dataChannel.OnOpen(func() {
+		close(dataChannelOpened)
+	})
+
+	require.NoError(t, signalPair(offer, answer))
+	select {
+	case <-dataChannelOpened:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for data channel to open")
+	}
+	require.Eventually(t, func() bool {
+		return answer.ConnectionState() == PeerConnectionStateConnected
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, offer.Close())
+	require.Eventually(t, func() bool {
+		return answer.ConnectionState() == PeerConnectionStateClosed
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestBoringSSLFactory_SpedFallsBackWithNonSpedPeer(t *testing.T) {
 	answerSettingEngine := SettingEngine{}
 	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
