@@ -108,6 +108,7 @@ type SettingEngine struct {
 	iceUDPMux                                 ice.UDPMux
 	iceProxyDialer                            proxy.Dialer
 	iceDisableActiveTCP                       bool
+	iceUseCandidateCheckPriority              bool
 	iceBindingRequestHandler                  func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool //nolint:lll
 	disableMediaEngineCopy                    bool
 	disableMediaEngineMultipleCodecs          bool
@@ -712,6 +713,17 @@ func (e *SettingEngine) SetICEBindingRequestHandler(
 	bindingRequestHandler func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool,
 ) {
 	e.iceBindingRequestHandler = bindingRequestHandler
+}
+
+// SetICEUseCandidateCheckPriority controls whether an ICE-lite agent checks
+// candidate-pair priority before accepting a subsequent USE-CANDIDATE
+// nomination. When enabled, the first nominated pair is retained unless a
+// later standard nomination has a strictly higher priority. Explicit ICE
+// renomination continues to follow the configured renomination rules.
+//
+// The default is false, preserving the existing ICE-lite nomination behavior.
+func (e *SettingEngine) SetICEUseCandidateCheckPriority(enabled bool) {
+	e.iceUseCandidateCheckPriority = enabled
 }
 
 // SetFireOnTrackBeforeFirstRTP sets if firing the OnTrack event should happen

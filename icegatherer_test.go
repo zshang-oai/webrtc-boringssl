@@ -110,6 +110,57 @@ func TestICEGatherer_InvalidMDNSHostName(t *testing.T) {
 	assert.ErrorIs(t, err, ice.ErrInvalidMulticastDNSHostName)
 }
 
+func TestICEGatherer_UseCandidateCheckPriority(t *testing.T) {
+	defaultGatherer, err := NewAPI().NewICEGatherer(ICEGatherOptions{})
+	require.NoError(t, err)
+	defaultOptionCount := len(defaultGatherer.baseAgentOptions(ice.MulticastDNSModeDisabled))
+
+	testCases := []struct {
+		name              string
+		configure         func(*SettingEngine)
+		expectExtraOption bool
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name: "explicitly disabled",
+			configure: func(settingEngine *SettingEngine) {
+				settingEngine.SetICEUseCandidateCheckPriority(false)
+			},
+		},
+		{
+			name: "enabled for ICE-lite",
+			configure: func(settingEngine *SettingEngine) {
+				settingEngine.SetLite(true)
+				settingEngine.SetICEUseCandidateCheckPriority(true)
+			},
+			expectExtraOption: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			settingEngine := SettingEngine{}
+			if testCase.configure != nil {
+				testCase.configure(&settingEngine)
+			}
+
+			gatherer, err := NewAPI(WithSettingEngine(settingEngine)).NewICEGatherer(ICEGatherOptions{})
+			require.NoError(t, err)
+
+			options := gatherer.baseAgentOptions(ice.MulticastDNSModeDisabled)
+			expectedOptions := defaultOptionCount
+			if testCase.expectExtraOption {
+				expectedOptions++
+			}
+			assert.Len(t, options, expectedOptions)
+			require.NoError(t, gatherer.createAgent())
+			require.NoError(t, gatherer.Close())
+		})
+	}
+}
+
 func TestICEGatherer_updateServers(t *testing.T) {
 	lim := test.TimeOut(time.Second * 10)
 	defer lim.Stop()

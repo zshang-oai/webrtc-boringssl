@@ -54,6 +54,17 @@ func TestSetConnectionTimeout(t *testing.T) {
 	assert.Equal(t, *s.timeout.ICEKeepaliveInterval, 3*time.Second)
 }
 
+func TestSetICEUseCandidateCheckPriority(t *testing.T) {
+	settingEngine := SettingEngine{}
+	assert.False(t, settingEngine.iceUseCandidateCheckPriority)
+
+	settingEngine.SetICEUseCandidateCheckPriority(true)
+	assert.True(t, settingEngine.iceUseCandidateCheckPriority)
+
+	settingEngine.SetICEUseCandidateCheckPriority(false)
+	assert.False(t, settingEngine.iceUseCandidateCheckPriority)
+}
+
 func TestICERenomination(t *testing.T) {
 	t.Run("EnableWithDefaultGenerator", func(t *testing.T) {
 		s := SettingEngine{}
