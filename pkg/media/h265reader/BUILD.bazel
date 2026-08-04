@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "h265reader",
+    srcs = [
+        "h265reader.go",
+        "nalunittype.go",
+    ],
+    importpath = "github.com/pion/webrtc/v4/pkg/media/h265reader",
+    importpath_aliases = ["github.com/pion/webrtc/pkg/media/h265reader"],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":h265reader",
+    visibility = ["//visibility:public"],
+)

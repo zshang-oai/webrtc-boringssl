@@ -1,0 +1,20 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "h265writer",
+    srcs = ["h265writer.go"],
+    importpath = "github.com/pion/webrtc/v4/pkg/media/h265writer",
+    importpath_aliases = ["github.com/pion/webrtc/pkg/media/h265writer"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/media/h265reader",
+        "@com_github_pion_rtp//:rtp",
+        "@com_github_pion_rtp//codecs",
+    ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":h265writer",
+    visibility = ["//visibility:public"],
+)
