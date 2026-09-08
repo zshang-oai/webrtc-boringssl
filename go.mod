@@ -37,3 +37,5 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/pion/sctp => github.com/yzh-api/sctp v1.10.1-0.20260908054458-3fb21d82d343

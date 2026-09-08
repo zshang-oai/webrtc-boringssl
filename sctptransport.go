@@ -62,6 +62,8 @@ type SCTPTransport struct {
 	onCloseHandler func(error)
 
 	sctpAssociation            *sctp.Association
+	messageAckEvents           <-chan SCTPMessageAck
+	messageAckEventsDropped    uint64
 	onDataChannelHandler       func(*DataChannel)
 	onDataChannelOpenedHandler func(*DataChannel)
 
@@ -151,6 +153,7 @@ func (r *SCTPTransport) Start(capabilities SCTPCapabilities) error {
 
 	r.lock.Lock()
 	r.sctpAssociation = sctpAssociation
+	r.messageAckEvents = sctpAssociation.MessageAcks()
 	r.state = SCTPTransportStateConnected
 	dataChannels := append([]*DataChannel{}, r.dataChannels...)
 	r.lock.Unlock()
@@ -190,6 +193,9 @@ func (r *SCTPTransport) sctpClientOptions(netConn net.Conn, maxMessageSize uint3
 
 func (r *SCTPTransport) optionalSCTPClientOptions() []sctp.ClientOption {
 	opts := make([]sctp.ClientOption, 0, 7)
+	if r.api.settingEngine.sctp.messageAckBufferSize != 0 {
+		opts = append(opts, sctp.WithMessageAckBufferSize(r.api.settingEngine.sctp.messageAckBufferSize))
+	}
 
 	if r.api.settingEngine.sctp.maxReceiveBufferSize != 0 {
 		opts = append(opts, sctp.WithMaxReceiveBufferSize(r.api.settingEngine.sctp.maxReceiveBufferSize))
@@ -234,6 +240,7 @@ func (r *SCTPTransport) Stop() error {
 	}
 
 	r.sctpAssociation.Abort("")
+	r.messageAckEventsDropped = r.sctpAssociation.MessageAckEventsDropped()
 
 	r.sctpAssociation = nil
 	r.state = SCTPTransportStateClosed

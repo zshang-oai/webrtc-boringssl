@@ -87,6 +87,7 @@ type SettingEngine struct {
 	}
 	sctp struct {
 		maxReceiveBufferSize uint32
+		messageAckBufferSize int
 		enableZeroChecksum   bool
 		rtoMax               time.Duration
 		maxMessageSize       uint32
@@ -605,6 +606,21 @@ func (e *SettingEngine) SetDTLSKeyLogWriter(writer io.Writer) {
 // Leave this 0 for the default maxReceiveBufferSize.
 func (e *SettingEngine) SetSCTPMaxReceiveBufferSize(maxReceiveBufferSize uint32) {
 	e.sctp.maxReceiveBufferSize = maxReceiveBufferSize
+}
+
+// SetSCTPMessageAckBufferSize enables optional transport acknowledgment events
+// for reliable messages sent through the existing DataChannel send methods.
+// Zero (the default) disables tracking. Call this before creating the connection.
+// Events are available from SCTPTransport.MessageAcks after SCTP starts. A full
+// buffer drops events rather than blocking sends or acknowledgment processing;
+// inspect SCTPTransport.MessageAckEventsDropped when consuming the measurements.
+func (e *SettingEngine) SetSCTPMessageAckBufferSize(bufferSize int) error {
+	if bufferSize < 0 {
+		return errSCTPMessageAckBufferSize
+	}
+	e.sctp.messageAckBufferSize = bufferSize
+
+	return nil
 }
 
 // EnableSCTPZeroChecksum controls the zero checksum feature in SCTP.
