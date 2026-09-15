@@ -78,8 +78,8 @@ github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD
 github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
 github.com/wlynxg/anet v0.0.5/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
-github.com/zshang-oai/ice/v4 v4.0.0-20260519235054-e1f057f28103 h1:m7C/q4BmPxH5G1cJPCBwgkXVLYutoCG4a2Z4cfHi9UQ=
-github.com/zshang-oai/ice/v4 v4.0.0-20260519235054-e1f057f28103/go.mod h1:tmp90fBKpZhQDkHkp/QJb+Gn8vhMxuAcMq7PfhQWQHE=
+github.com/zshang-oai/ice/v4 v4.0.0-20260915211853-040333df0233 h1:88PmdXlhCwHiKQPppwXC/Y3qUhkAWmQS6/AUAqLaJv8=
+github.com/zshang-oai/ice/v4 v4.0.0-20260915211853-040333df0233/go.mod h1:tmp90fBKpZhQDkHkp/QJb+Gn8vhMxuAcMq7PfhQWQHE=
 golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
 golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
 golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=

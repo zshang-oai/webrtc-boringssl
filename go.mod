@@ -2,7 +2,7 @@ module github.com/pion/webrtc/v4
 
 go 1.24.0
 
-replace github.com/pion/ice/v4 => github.com/zshang-oai/ice/v4 v4.0.0-20260519235054-e1f057f28103
+replace github.com/pion/ice/v4 => github.com/zshang-oai/ice/v4 v4.0.0-20260915211853-040333df0233
 
 require (
 	github.com/pion/datachannel v1.6.0

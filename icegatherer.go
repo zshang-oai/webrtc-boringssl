@@ -258,6 +258,7 @@ func (g *ICEGatherer) baseAgentOptions(mDNSMode ice.MulticastDNSMode) []ice.Agen
 		ice.WithUDPMux(g.api.settingEngine.iceUDPMux),
 		ice.WithProxyDialer(g.api.settingEngine.iceProxyDialer),
 		ice.WithBindingRequestHandler(g.api.settingEngine.iceBindingRequestHandler),
+		ice.WithCandidatePairPacketHandler(g.api.settingEngine.iceCandidatePairPacketHandler),
 	}
 	if g.api.settingEngine.iceUseCandidateCheckPriority {
 		options = append(options, ice.WithEnableUseCandidateCheckPriority())
