@@ -47,7 +47,7 @@ type DTLSTransport struct {
 	onStateChangeHandler   func(DTLSTransportState)
 	internalOnCloseHandler func()
 
-	conn *dtls.Conn
+	conn DTLSConn
 
 	srtpSession, srtcpSession   atomic.Value
 	srtpEndpoint, srtcpEndpoint *mux.Endpoint
@@ -81,6 +81,21 @@ func (r *srtpRTPReader) Read(in []byte, a interceptor.Attributes) (int, intercep
 	n, err := r.readStream.Read(in)
 
 	return n, a, err
+}
+
+type dtlsHandshaker interface {
+	Handshake() error
+	HandshakeContext(context.Context) error
+}
+
+// dtlsCloseNotifyHandlerSetter is implemented by DTLS connections that need
+// an explicit hook to surface a peer close_notify to the PeerConnection.
+//
+// pion/dtls closes its underlying mux endpoint when its background reader sees
+// close_notify. Factories that own their own DTLS reader need to preserve that
+// behavior themselves.
+type dtlsCloseNotifyHandlerSetter interface {
+	setCloseNotifyHandler(func())
 }
 
 // NewDTLSTransport creates a new DTLSTransport.
@@ -237,13 +252,13 @@ func (t *DTLSTransport) startSRTP() error {
 		)
 	}
 
-	connState, ok := t.conn.ConnectionState()
+	exporter, ok := t.conn.KeyingMaterialExporter()
 	if !ok {
 		// nolint
-		return fmt.Errorf("%w: Failed to get DTLS ConnectionState", errDtlsKeyExtractionFailed)
+		return fmt.Errorf("%w: Failed to get DTLS KeyingMaterialExporter", errDtlsKeyExtractionFailed)
 	}
 
-	err := srtpConfig.ExtractSessionKeysFromDTLS(&connState, t.role() == DTLSRoleClient)
+	err := srtpConfig.ExtractSessionKeysFromDTLS(exporter, t.role() == DTLSRoleClient)
 	if err != nil {
 		// nolint
 		return fmt.Errorf("%w: %v", errDtlsKeyExtractionFailed, err)
@@ -320,12 +335,12 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 // transport. If the context is canceled before the DTLS handshake is complete, the handshake
 // is interrupted and an error is returned.
 func (t *DTLSTransport) StartContext(ctx context.Context, remoteParameters DTLSParameters) error {
-	return t.start(remoteParameters, func(dtlsConn *dtls.Conn) error {
+	return t.start(remoteParameters, func(dtlsConn dtlsHandshaker) error {
 		return dtlsConn.HandshakeContext(ctx)
 	})
 }
 
-func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(*dtls.Conn) error) error {
+func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(dtlsHandshaker) error) error {
 	role, certificate, err := t.prepareStart(remoteParameters)
 	if err != nil {
 		return err
@@ -336,12 +351,15 @@ func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(*d
 
 	sharedOpts := t.dtlsSharedOptions(certificate)
 
-	dtlsConn, err := t.connectDTLS(dtlsEndpoint, role, sharedOpts)
+	dtlsConn, err := t.connectDTLS(dtlsEndpoint, role, sharedOpts, certificate)
 	if err != nil {
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsEndpoint.Close()
 
 		return t.failStart(err)
+	}
+	if closeNotifyConn, ok := dtlsConn.(dtlsCloseNotifyHandlerSetter); ok {
+		closeNotifyConn.setCloseNotifyHandler(t.internalOnCloseHandler)
 	}
 
 	if err = handshake(dtlsConn); err != nil {
@@ -459,7 +477,41 @@ func (t *DTLSTransport) srtpProtectionProfiles() []dtls.SRTPProtectionProfile {
 	return defaultSrtpProtectionProfiles()
 }
 
+func (t *DTLSTransport) dtlsConfig(certificate tls.Certificate) *dtls.Config {
+	config := &dtls.Config{
+		Certificates:                  []tls.Certificate{certificate},
+		SRTPProtectionProfiles:        t.srtpProtectionProfiles(),
+		ClientAuth:                    dtls.RequireAnyClientCert,
+		LoggerFactory:                 t.api.settingEngine.LoggerFactory,
+		InsecureSkipVerify:            !t.api.settingEngine.dtls.disableInsecureSkipVerify,
+		CipherSuites:                  t.api.settingEngine.dtls.cipherSuites,
+		CustomCipherSuites:            t.api.settingEngine.dtls.customCipherSuites,
+		FlightInterval:                t.api.settingEngine.dtls.retransmissionInterval,
+		InsecureSkipVerifyHello:       t.api.settingEngine.dtls.insecureSkipHelloVerify,
+		EllipticCurves:                t.api.settingEngine.dtls.ellipticCurves,
+		ExtendedMasterSecret:          t.api.settingEngine.dtls.extendedMasterSecret,
+		ClientCAs:                     t.api.settingEngine.dtls.clientCAs,
+		RootCAs:                       t.api.settingEngine.dtls.rootCAs,
+		KeyLogWriter:                  t.api.settingEngine.dtls.keyLogWriter,
+		SupportedProtocols:            t.api.settingEngine.dtls.supportedProtocols,
+		ClientHelloMessageHook:        t.api.settingEngine.dtls.clientHelloMessageHook,
+		ServerHelloMessageHook:        t.api.settingEngine.dtls.serverHelloMessageHook,
+		CertificateRequestMessageHook: t.api.settingEngine.dtls.certificateRequestMessageHook,
+		VerifyPeerCertificate:         t.verifyPeerCertificateFunc(),
+	}
+	if t.api.settingEngine.replayProtection.DTLS != nil {
+		config.ReplayProtectionWindow = int(*t.api.settingEngine.replayProtection.DTLS) //nolint:gosec // G115
+	}
+	if t.api.settingEngine.dtls.clientAuth != nil {
+		config.ClientAuth = *t.api.settingEngine.dtls.clientAuth
+	}
+
+	return config
+}
+
 func (t *DTLSTransport) verifyPeerCertificateFunc() func([][]byte, [][]*x509.Certificate) error {
+	// WebRTC auth is based on the peer leaf certificate fingerprint, so this
+	// callback intentionally ignores verifiedChains.
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
 			return errNoRemoteCertificate
@@ -486,24 +538,53 @@ func (t *DTLSTransport) connectDTLS(
 	dtlsEndpoint *mux.Endpoint,
 	role DTLSRole,
 	sharedOpts []dtls.Option,
-) (*dtls.Conn, error) {
+	certificate tls.Certificate,
+) (DTLSConn, error) {
+	if factory := t.api.settingEngine.dtls.factory; factory != nil {
+		return t.connectDTLSWithFactory(dtlsEndpoint, role, certificate, factory)
+	}
+
 	if role == DTLSRoleClient {
 		clientOpts := t.toDTLSClientOptions(sharedOpts)
 
-		return dtls.ClientWithOptions(
+		conn, err := dtls.ClientWithOptions(
 			dtlsEndpoint,
 			dtlsEndpoint.RemoteAddr(),
 			clientOpts...,
 		)
+		if err != nil {
+			return nil, err
+		}
+
+		return &pionDTLSConn{Conn: conn}, nil
 	}
 
 	serverOpts := t.toDTLSServerOptions(sharedOpts)
 
-	return dtls.ServerWithOptions(
+	conn, err := dtls.ServerWithOptions(
 		dtlsEndpoint,
 		dtlsEndpoint.RemoteAddr(),
 		serverOpts...,
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pionDTLSConn{Conn: conn}, nil
+}
+
+func (t *DTLSTransport) connectDTLSWithFactory(
+	dtlsEndpoint *mux.Endpoint,
+	role DTLSRole,
+	certificate tls.Certificate,
+	factory DTLSFactory,
+) (DTLSConn, error) {
+	config := t.dtlsConfig(certificate)
+	if role == DTLSRoleClient {
+		return factory.Client(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), config)
+	}
+
+	return factory.Server(dtlsEndpoint, dtlsEndpoint.RemoteAddr(), config)
 }
 
 func (t *DTLSTransport) toDTLSServerOptions(sharedOpts []dtls.Option) []dtls.ServerOption {
@@ -556,7 +637,7 @@ func (t *DTLSTransport) toDTLSClientOptions(sharedOpts []dtls.Option) []dtls.Cli
 	return clientOpts
 }
 
-func (t *DTLSTransport) handshakeDTLS(dtlsConn *dtls.Conn) error {
+func (t *DTLSTransport) handshakeDTLS(dtlsConn dtlsHandshaker) error {
 	if t.api.settingEngine.dtls.connectContextMaker == nil {
 		return dtlsConn.Handshake()
 	}
@@ -569,7 +650,7 @@ func (t *DTLSTransport) handshakeDTLS(dtlsConn *dtls.Conn) error {
 	return dtlsConn.HandshakeContext(handshakeCtx)
 }
 
-func (t *DTLSTransport) completeStart(dtlsConn *dtls.Conn) error {
+func (t *DTLSTransport) completeStart(dtlsConn DTLSConn) error {
 	srtpProtectionProfile, err := srtpProtectionProfileFromDTLSConn(dtlsConn)
 
 	t.lock.Lock()
@@ -596,7 +677,7 @@ func (t *DTLSTransport) failStart(err error) error {
 	return err
 }
 
-func srtpProtectionProfileFromDTLSConn(dtlsConn *dtls.Conn) (srtp.ProtectionProfile, error) {
+func srtpProtectionProfileFromDTLSConn(dtlsConn DTLSConn) (srtp.ProtectionProfile, error) {
 	srtpProfile, ok := dtlsConn.SelectedSRTPProtectionProfile()
 	if !ok {
 		return 0, ErrNoSRTPProtectionProfile
