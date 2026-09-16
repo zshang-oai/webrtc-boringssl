@@ -5,11 +5,14 @@ package mux
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
 	"github.com/pion/transport/v5/packetio"
 	"github.com/pion/transport/v5/test"
@@ -120,6 +123,16 @@ type writeDeadlineErrorConn struct {
 	deadlineErr error
 }
 
+type writeResultConn struct {
+	net.Conn
+	n   int
+	err error
+}
+
+func (w *writeResultConn) Write([]byte) (int, error) {
+	return w.n, w.err
+}
+
 func (w *writeDeadlineErrorConn) SetDeadline(t time.Time) error {
 	if w.deadlineErr != nil {
 		return w.deadlineErr
@@ -156,6 +169,74 @@ func TestEndpointSetDeadlineWriteDeadlineError(t *testing.T) {
 	require.NoError(t, mux.Close())
 	require.NoError(t, ca.Close())
 	require.NoError(t, rdConn.Close())
+}
+
+// No ICE route is packet loss for every WebRTC mux user. Only that wholly
+// unsent case is accepted; other results retain their normal write semantics.
+func TestEndpointWriteNoRoutePolicy(t *testing.T) {
+	packet := []byte("datagram")
+	for _, tc := range []struct {
+		name    string
+		n       int
+		err     error
+		wantN   int
+		wantErr error
+	}{
+		{name: "no route", err: ice.ErrNoCandidatePairs, wantN: len(packet)},
+		{name: "wrapped no route", err: fmt.Errorf("write: %w", ice.ErrNoCandidatePairs), wantN: len(packet)},
+		{name: "partial no route", n: 1, err: ice.ErrNoCandidatePairs, wantN: 1, wantErr: ice.ErrNoCandidatePairs},
+		{name: "ICE closed", err: ice.ErrClosed, wantErr: io.ErrClosedPipe},
+		{name: "closed pipe", err: io.ErrClosedPipe, wantErr: io.ErrClosedPipe},
+		{name: "deadline", err: os.ErrDeadlineExceeded, wantErr: os.ErrDeadlineExceeded},
+		{name: "other error", err: io.ErrUnexpectedEOF, wantErr: io.ErrUnexpectedEOF},
+		{name: "short write", n: 1, wantN: 1},
+		{name: "success", n: len(packet), wantN: len(packet)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := &Endpoint{mux: &Mux{nextConn: &writeResultConn{n: tc.n, err: tc.err}}}
+			for _, write := range []func([]byte) (int, error){
+				endpoint.Write,
+				func(p []byte) (int, error) { return endpoint.WriteTo(p, nil) },
+			} {
+				n, err := write(packet)
+				require.Equal(t, tc.wantN, n)
+				require.ErrorIs(t, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Observe the real ICE result below the mux: accepting a lost datagram must not
+// change ICE's direct error contract or count bytes as physically sent.
+func TestEndpointNoRouteUsesRealICEError(t *testing.T) {
+	agent, err := ice.NewAgentWithOptions(ice.WithMulticastDNSMode(ice.MulticastDNSModeDisabled))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, agent.Close()) })
+	conn, err := agent.StartDial("remote-ufrag", "remote-password")
+	require.NoError(t, err)
+	lower := &recordICEWriteConn{Conn: conn}
+	m := NewMux(Config{Conn: lower, BufferSize: testPipeBufferSize, LoggerFactory: logging.NewDefaultLoggerFactory()})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	endpoint := m.NewEndpoint(MatchAll)
+	packet := []byte("datagram")
+	n, err := endpoint.Write(packet)
+	require.NoError(t, err)
+	require.Equal(t, len(packet), n)
+	require.Zero(t, lower.n)
+	require.ErrorIs(t, lower.err, ice.ErrNoCandidatePairs)
+	require.Zero(t, conn.BytesSent())
+}
+
+type recordICEWriteConn struct {
+	net.Conn
+	n   int
+	err error
+}
+
+func (c *recordICEWriteConn) Write(packet []byte) (int, error) {
+	c.n, c.err = c.Conn.Write(packet)
+
+	return c.n, c.err
 }
 
 type muxErrorConnReadResult struct {

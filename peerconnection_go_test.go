@@ -1980,6 +1980,55 @@ func TestPeerConnectionState(t *testing.T) {
 	assert.Equal(t, PeerConnectionStateClosed, pc.ConnectionState())
 }
 
+func TestPeerConnectionStartSCTPWhenReadyDefersDuringSpedICEChecking(t *testing.T) {
+	se := SettingEngine{}
+	se.EnableSped(true)
+
+	pc, err := NewAPI(WithSettingEngine(se)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, pc.Close())
+	}()
+
+	pc.onICEConnectionStateChange(ICEConnectionStateChecking)
+	pc.startSCTPWhenReady(4321, []byte("remote-init"))
+
+	require.NotNil(t, pc.pendingSCTP)
+	require.Equal(t, uint32(4321), pc.pendingSCTP.maxMessageSize)
+	require.Equal(t, []byte("remote-init"), pc.pendingSCTP.remoteSctpInit)
+	require.Equal(t, SCTPTransportStateConnecting, pc.sctpTransport.State())
+}
+
+func TestPeerConnectionStartSCTPWhenReadyDoesNotDeferWithoutSped(t *testing.T) {
+	pc, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, pc.Close())
+	}()
+
+	pc.onICEConnectionStateChange(ICEConnectionStateChecking)
+	pc.startSCTPWhenReady(4321, []byte("remote-init"))
+
+	require.Nil(t, pc.pendingSCTP)
+}
+
+func TestPeerConnectionCanStartSCTPUsesLegacyICEStateWithoutSped(t *testing.T) {
+	pc, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, pc.Close())
+	}()
+
+	pc.onICEConnectionStateChange(ICEConnectionStateChecking)
+	require.False(t, pc.canStartSCTP())
+
+	pc.onICEConnectionStateChange(ICEConnectionStateConnected)
+	require.True(t, pc.canStartSCTP())
+
+	pc.onICEConnectionStateChange(ICEConnectionStateCompleted)
+	require.True(t, pc.canStartSCTP())
+}
+
 func TestPeerConnectionDeadlock(t *testing.T) {
 	lim := test.TimeOut(time.Second * 5)
 	defer lim.Stop()

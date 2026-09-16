@@ -184,6 +184,64 @@ func TestBoringSSLFactory_ReadDoesNotBlockConcurrentWrite(t *testing.T) {
 	}
 }
 
+func TestBoringSSLFactory_HandshakeCompletionReleasesQueuedInjectedPacket(t *testing.T) {
+	conn := &boringSSLConn{
+		injectedPackets: make(chan injectedPacket, 1),
+	}
+	injectDone := make(chan error, 1)
+	go func() {
+		injectDone <- conn.InjectInboundPacket([]byte("embedded-final-flight"), nil)
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(conn.injectedPackets) == 1
+	}, time.Second, time.Millisecond)
+
+	// An ordinary DTLS record can complete the handshake while ICE is
+	// synchronously waiting for an embedded retransmission to be processed.
+	conn.finishHandshake(nil)
+
+	select {
+	case err := <-injectDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "queued injected packet was not released after handshake completion")
+	}
+
+	_, ok := conn.takeInjectedPacket()
+	require.False(t, ok)
+}
+
+func TestBoringSSLFactory_HandshakeCompletionRacingWithInjectionDoesNotBlock(t *testing.T) {
+	for range 100 {
+		conn := &boringSSLConn{
+			injectedPackets: make(chan injectedPacket, 1),
+		}
+		start := make(chan struct{})
+		injectDone := make(chan error, 1)
+		handshakeDone := make(chan struct{})
+
+		go func() {
+			<-start
+			injectDone <- conn.InjectInboundPacket([]byte("embedded-final-flight"), nil)
+		}()
+		go func() {
+			<-start
+			conn.finishHandshake(nil)
+			close(handshakeDone)
+		}()
+		close(start)
+
+		select {
+		case err := <-injectDone:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "injected packet raced past terminal handshake cleanup")
+		}
+		<-handshakeDone
+	}
+}
+
 func TestBoringSSLFactory_DataChannelCanSendWhileReadLoopIdle(t *testing.T) {
 	answerSettingEngine := SettingEngine{}
 	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
@@ -288,6 +346,91 @@ func TestBoringSSLFactory_CloseNotifyClosesPeerConnectionWithDataChannel(t *test
 	require.Eventually(t, func() bool {
 		return answer.ConnectionState() == PeerConnectionStateClosed
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestBoringSSLFactory_SpedFallsBackWithNonSpedPeer(t *testing.T) {
+	answerSettingEngine := SettingEngine{}
+	answerSettingEngine.SetDTLSFactory(NewBoringSSLFactory())
+	answerSettingEngine.SetDTLSInsecureSkipHelloVerify(true)
+	answerSettingEngine.EnableSped(true)
+
+	offer, err := NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	answer, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer closePairNow(t, offer, answer)
+
+	dataChannelID := uint16(0)
+	negotiated := true
+	dataChannelOptions := &DataChannelInit{
+		ID:         &dataChannelID,
+		Negotiated: &negotiated,
+	}
+
+	offerDataChannel, err := offer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+	answerDataChannel, err := answer.CreateDataChannel("control", dataChannelOptions)
+	require.NoError(t, err)
+
+	offerOpened := make(chan struct{})
+	answerOpened := make(chan struct{})
+	receivedMessage := make(chan string, 1)
+	offerDataChannel.OnOpen(func() {
+		close(offerOpened)
+	})
+	answerDataChannel.OnOpen(func() {
+		close(answerOpened)
+	})
+	offerDataChannel.OnMessage(func(message DataChannelMessage) {
+		receivedMessage <- string(message.Data)
+	})
+
+	require.NoError(t, signalPairWithOptions(offer, answer, withDisableInitialDataChannel(true)))
+
+	select {
+	case <-offerOpened:
+	case <-time.After(5 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for offer data channel to open")
+	}
+	select {
+	case <-answerOpened:
+	case <-time.After(5 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for answer data channel to open")
+	}
+
+	require.NoError(t, answerDataChannel.SendText("sped-fallback-ready"))
+
+	select {
+	case message := <-receivedMessage:
+		assert.Equal(t, "sped-fallback-ready", message)
+	case <-time.After(2 * time.Second):
+		t.Log(connectionDebugState(offer, answer))
+		require.FailNow(t, "timed out waiting for fallback data channel message")
+	}
+}
+
+func connectionDebugState(offer, answer *PeerConnection) string {
+	return fmt.Sprintf(
+		"offer(pc=%s ice=%s dtls=%s) answer(pc=%s ice=%s dtls=%s)",
+		offer.ConnectionState(),
+		offer.ICEConnectionState(),
+		offer.dtlsTransport.State(),
+		answer.ConnectionState(),
+		answer.ICEConnectionState(),
+		answer.dtlsTransport.State(),
+	)
+}
+
+func TestPacketConnAsConn_UnconnectedUDPConnUsesPacketConnStream(t *testing.T) {
+	conn := newLocalUDPConn(t)
+	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478}
+
+	wrapped := packetConnAsConn(conn, remote)
+	stream, ok := wrapped.(*packetConnStream)
+	require.True(t, ok)
+	assert.Equal(t, remote, stream.RemoteAddr())
 }
 
 func newLocalUDPConn(t *testing.T) *net.UDPConn {

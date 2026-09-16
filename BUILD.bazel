@@ -24,6 +24,7 @@ go_library(
         "@com_github_pion_dtls_v3//:dtls",
         "@com_github_pion_dtls_v3//pkg/crypto/elliptic",
         "@com_github_pion_dtls_v3//pkg/crypto/fingerprint",
+        "@com_github_pion_dtls_v3//pkg/protocol",
         "@com_github_pion_dtls_v3//pkg/protocol/handshake",
         "@com_github_pion_ice_v4//:ice",
         "@com_github_pion_interceptor//:interceptor",

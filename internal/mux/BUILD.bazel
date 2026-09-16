@@ -25,10 +25,17 @@ alias(
 
 go_test(
     name = "mux_test",
-    srcs = ["mux_test.go"],
+    srcs = [
+        "endpoint_media_test.go",
+        "mux_test.go",
+    ],
     embed = [":mux"],
     deps = [
+        "@com_github_pion_ice_v4//:ice",
         "@com_github_pion_logging//:logging",
+        "@com_github_pion_rtcp//:rtcp",
+        "@com_github_pion_rtp//:rtp",
+        "@com_github_pion_srtp_v3//:srtp",
         "@com_github_pion_transport_v5//packetio",
         "@com_github_pion_transport_v5//test",
         "@com_github_stretchr_testify//require",

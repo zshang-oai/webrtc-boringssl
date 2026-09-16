@@ -88,6 +88,7 @@ func (api *API) NewSCTPTransport(dtls *DTLSTransport) *SCTPTransport {
 		api:                api,
 		log:                api.settingEngine.LoggerFactory.NewLogger("ortc"),
 		dataChannelIDsUsed: make(map[uint16]struct{}),
+		localSctpInit:      append([]byte(nil), api.settingEngine.sctp.snapLocalInit...),
 	}
 
 	res.updateMaxChannels()
@@ -549,7 +550,8 @@ func (r *SCTPTransport) BufferedAmount() int {
 	return r.sctpAssociation.BufferedAmount()
 }
 
-// GetSctpInit returns the current sctp-init attribute and caches the last created.
+// GetSctpInit returns the configured or generated sctp-init attribute.
+// Generated values are cached after the first request.
 // The caller should hold the lock.
 func (r *SCTPTransport) GetSctpInit() []byte {
 	if len(r.localSctpInit) == 0 {

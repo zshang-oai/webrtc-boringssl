@@ -8,10 +8,12 @@ package webrtc
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/dtls/v3/pkg/protocol"
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v4/internal/mux"
@@ -22,6 +24,8 @@ import (
 // transport over which packets are sent and received.
 type ICETransport struct {
 	lock sync.RWMutex
+	// Serialize Restart and Gather without holding the lock needed by SPED callbacks.
+	restartMu sync.Mutex
 
 	role ICERole
 
@@ -36,8 +40,13 @@ type ICETransport struct {
 	mux      *mux.Mux
 
 	ctxCancel func()
+	stopped   bool // Protected by lock; unlike state, never changed by queued ICE notifications.
 
 	loggerFactory logging.LoggerFactory
+
+	dtlsCallback      func(packet []byte, rAddr net.Addr)
+	dtlsCallbackCond  *sync.Cond
+	dtlsCallbackArmed bool
 
 	log logging.LeveledLogger
 }
@@ -69,7 +78,7 @@ func (t *ICETransport) GetSelectedCandidatePair() (*ICECandidatePair, error) {
 }
 
 // GetSelectedCandidatePairStats returns the selected candidate pair stats on which packets are sent
-// if there is no selected pair empty stats, false is returned to indicate stats not available.
+// if there is no selected pair, false is returned to indicate stats are not available.
 func (t *ICETransport) GetSelectedCandidatePairStats() (ICECandidatePairStats, bool) {
 	return t.gatherer.getSelectedCandidatePairStats()
 }
@@ -81,6 +90,7 @@ func NewICETransport(gatherer *ICEGatherer, loggerFactory logging.LoggerFactory)
 		loggerFactory: loggerFactory,
 		log:           loggerFactory.NewLogger("ortc"),
 	}
+	iceTransport.dtlsCallbackCond = sync.NewCond(&iceTransport.lock)
 	iceTransport.setState(ICETransportStateNew)
 
 	return iceTransport
@@ -104,6 +114,9 @@ func (t *ICETransport) StartContext(
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
+	if t.stopped {
+		return errICETransportClosed
+	}
 	if t.State() != ICETransportStateNew {
 		return errICETransportNotInNew
 	}
@@ -119,6 +132,12 @@ func (t *ICETransport) StartContext(
 	agent := t.gatherer.getAgent()
 	if agent == nil {
 		return fmt.Errorf("%w: unable to start ICETransport", errICEAgentNotExist)
+	}
+	if t.gatherer.api.settingEngine.enableSped {
+		agent.SetDtlsCallback(t.handleDtlsPacket)
+		t.dtlsCallbackArmed = true
+	} else {
+		agent.SetDtlsCallback(t.dtlsCallback)
 	}
 
 	if err := agent.OnConnectionStateChange(func(iceState ice.ConnectionState) {
@@ -153,47 +172,57 @@ func (t *ICETransport) StartContext(
 	callerCtx := ctx
 	operationCtx, ctxCancel := context.WithCancel(callerCtx)
 	t.ctxCancel = ctxCancel
+	sped := t.gatherer.api.settingEngine.enableSped
+	// StartDial/StartAccept do not wait for nomination. Observe cancellation
+	// during startup even when SPED skips AwaitConnect, but do not make the
+	// caller's context own the established transport after StartContext returns.
+	if callerCtx.Done() != nil {
+		stopCancelWatch := context.AfterFunc(callerCtx, func() { _ = t.Stop() })
+		defer stopCancelWatch()
+	}
 
-	// Drop the lock here to allow ICE candidates to be
-	// added so that the agent can complete a connection
+	// Drop the lock so candidate delivery and Stop can make progress.
 	t.lock.Unlock()
 
 	var iceConn *ice.Conn
 	var err error
-	switch *role {
-	case ICERoleControlling:
-		iceConn, err = agent.Dial(operationCtx,
-			params.UsernameFragment,
-			params.Password)
-
-	case ICERoleControlled:
-		iceConn, err = agent.Accept(operationCtx,
-			params.UsernameFragment,
-			params.Password)
-
-	default:
-		err = errICERoleUnknown
+	if err = operationCtx.Err(); err == nil {
+		switch *role {
+		case ICERoleControlling:
+			iceConn, err = agent.StartDial(params.UsernameFragment, params.Password)
+		case ICERoleControlled:
+			iceConn, err = agent.StartAccept(params.UsernameFragment, params.Password)
+		default:
+			err = errICERoleUnknown
+		}
+	}
+	if err == nil && !sped {
+		err = agent.AwaitConnect(operationCtx)
 	}
 
-	// Reacquire the lock to set the connection/mux
 	t.lock.Lock()
-	if err != nil {
-		if ctxErr := callerCtx.Err(); ctxErr != nil {
-			t.lock.Unlock()
-			_ = t.Stop()
-			t.lock.Lock()
+	if ctxErr := callerCtx.Err(); ctxErr != nil {
+		t.lock.Unlock()
+		_ = t.Stop()
+		t.lock.Lock()
 
-			return ctxErr
+		return ctxErr
+	}
+	if t.stopped {
+		return ice.ErrClosed
+	}
+	if err != nil {
+		if t.ctxCancel != nil {
+			t.ctxCancel()
+			t.ctxCancel = nil
+		}
+		if t.dtlsCallbackArmed {
+			t.disarmDtlsCallbackLocked()
+			agent.SetDtlsFailed()
+			agent.SetDtlsCallback(nil)
 		}
 
-		ctxCancel()
-		t.ctxCancel = nil
-
 		return err
-	}
-
-	if t.State() == ICETransportStateClosed {
-		return errICETransportClosed
 	}
 
 	t.conn = iceConn
@@ -208,25 +237,104 @@ func (t *ICETransport) StartContext(
 	return nil
 }
 
+func (t *ICETransport) SetDtlsCallback(cb func(packet []byte, rAddr net.Addr)) {
+	t.lock.Lock()
+	if t.stopped {
+		t.lock.Unlock()
+
+		return
+	}
+
+	t.dtlsCallback = cb
+
+	dtlsCallbackArmed := false
+	if t.gatherer != nil {
+		if agent := t.gatherer.getAgent(); agent != nil {
+			if t.gatherer.api.settingEngine.enableSped && cb != nil {
+				if !t.dtlsCallbackArmed {
+					agent.SetDtlsCallback(t.handleDtlsPacket)
+				}
+				dtlsCallbackArmed = true
+			} else {
+				agent.SetDtlsCallback(cb)
+			}
+		}
+	}
+	t.dtlsCallbackArmed = dtlsCallbackArmed
+	t.dtlsCallbackCond.Broadcast()
+	t.lock.Unlock()
+}
+
+// disarmDtlsCallbackLocked releases the early-packet barrier. It must run before
+// physical ICE closure and does not acquire the agent or gatherer lock.
+func (t *ICETransport) disarmDtlsCallbackLocked() {
+	t.dtlsCallback = nil
+	t.dtlsCallbackArmed = false
+	if t.dtlsCallbackCond != nil {
+		t.dtlsCallbackCond.Broadcast()
+	}
+}
+
+// CanWrite reports whether the ICE transport can write application data through
+// either its selected pair or its best valid pair.
+func (t *ICETransport) CanWrite() bool {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+
+	return !t.stopped && t.conn != nil && t.conn.CanWrite()
+}
+
+func (t *ICETransport) handleDtlsPacket(packet []byte, rAddr net.Addr) {
+	t.lock.Lock()
+	for t.dtlsCallback == nil && t.dtlsCallbackArmed && !t.stopped {
+		t.dtlsCallbackCond.Wait()
+	}
+	cb := t.dtlsCallback
+	t.lock.Unlock()
+
+	if cb != nil {
+		cb(packet, rAddr)
+	}
+}
+
 // restart is not exposed currently because ORTC has users create a whole new ICETransport
 // so for now lets keep it private so we don't cause ORTC users to depend on non-standard APIs.
 func (t *ICETransport) restart() error {
-	t.lock.Lock()
-	defer t.lock.Unlock()
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
 
-	agent := t.gatherer.getAgent()
+	t.lock.RLock()
+	gatherer, stopped := t.gatherer, t.stopped
+	t.lock.RUnlock()
+	if stopped {
+		return errICETransportClosed
+	}
+	if gatherer == nil {
+		return fmt.Errorf("%w: unable to restart ICETransport", errICEAgentNotExist)
+	}
+
+	agent := gatherer.getAgent()
 	if agent == nil {
 		return fmt.Errorf("%w: unable to restart ICETransport", errICEAgentNotExist)
 	}
 
+	// Restart and Gather wait for the ICE task loop. That loop can synchronously
+	// deliver a SPED packet through handleDtlsPacket, which needs t.lock.
 	if err := agent.Restart(
-		t.gatherer.api.settingEngine.candidates.UsernameFragment,
-		t.gatherer.api.settingEngine.candidates.Password,
+		gatherer.api.settingEngine.candidates.UsernameFragment,
+		gatherer.api.settingEngine.candidates.Password,
 	); err != nil {
 		return err
 	}
 
-	return t.gatherer.Gather()
+	t.lock.RLock()
+	stopped = t.stopped
+	t.lock.RUnlock()
+	if stopped {
+		return errICETransportClosed
+	}
+
+	return gatherer.Gather()
 }
 
 // Stop irreversibly stops the ICETransport.
@@ -243,13 +351,18 @@ func (t *ICETransport) GracefulStop() error {
 
 func (t *ICETransport) stop(shouldGracefullyClose bool) error {
 	t.lock.Lock()
+	t.stopped = true
 	t.setState(ICETransportStateClosed)
+	// An early SPED packet may be waiting on the ICE task loop for DTLS setup.
+	// Release it before closing the agent, whose Close joins that task loop.
+	t.disarmDtlsCallbackLocked()
 
 	if t.ctxCancel != nil {
 		t.ctxCancel()
+		t.ctxCancel = nil
 	}
 
-	// mux and gatherer can only be set when ICETransport.State != Closed.
+	// The stopped latch prevents startup from installing a late mux or gatherer.
 	mux := t.mux
 	gatherer := t.gatherer
 	t.lock.Unlock()
@@ -388,10 +501,7 @@ func (t *ICETransport) GetLocalParameters() (ICEParameters, error) {
 // GetRemoteParameters returns an IceParameters object which provides information
 // uniquely identifying the remote peer for the duration of the ICE session.
 func (t *ICETransport) GetRemoteParameters() (ICEParameters, error) {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	agent := t.gatherer.getAgent()
+	agent := t.remoteCredentialsAgent()
 	if agent == nil {
 		return ICEParameters{}, fmt.Errorf("%w: unable to get remote parameters", errICEAgentNotExist)
 	}
@@ -456,10 +566,7 @@ func (t *ICETransport) collectStats(collector *statsReportCollector) {
 }
 
 func (t *ICETransport) haveRemoteCredentialsChange(newUfrag, newPwd string) bool {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	agent := t.gatherer.getAgent()
+	agent := t.remoteCredentialsAgent()
 	if agent == nil {
 		return false
 	}
@@ -473,13 +580,80 @@ func (t *ICETransport) haveRemoteCredentialsChange(newUfrag, newPwd string) bool
 }
 
 func (t *ICETransport) setRemoteCredentials(newUfrag, newPwd string) error {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	agent := t.gatherer.getAgent()
+	agent := t.remoteCredentialsAgent()
 	if agent == nil {
 		return fmt.Errorf("%w: unable to SetRemoteCredentials", errICEAgentNotExist)
 	}
 
 	return agent.SetRemoteCredentials(newUfrag, newPwd)
+}
+
+// Credential operations also wait for the ICE task loop. Take a snapshot so
+// neither the gatherer lookup nor those operations hold the SPED callback lock.
+func (t *ICETransport) remoteCredentialsAgent() *ice.Agent {
+	t.lock.RLock()
+	gatherer := t.gatherer
+	t.lock.RUnlock()
+	if gatherer == nil {
+		return nil
+	}
+
+	return gatherer.getAgent()
+}
+
+// Piggyback forwards a complete DTLS flight to the ICE Agent for STUN embedding.
+func (t *ICETransport) Piggyback(datagrams [][]byte, rAddr net.Addr) bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.stopped || t.gatherer == nil {
+		return false
+	}
+
+	agent := t.gatherer.getAgent()
+	if agent == nil {
+		t.log.Warnf("%w: unable to piggyback DTLS packet", errICEAgentNotExist)
+
+		return false
+	}
+
+	return agent.Piggyback(datagrams, rAddr)
+}
+
+func (t *ICETransport) ReportDtlsPacket(packet []byte) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.stopped || t.gatherer == nil {
+		return
+	}
+
+	agent := t.gatherer.getAgent()
+	if agent == nil {
+		t.log.Warnf("%w: unable to report DTLS packet", errICEAgentNotExist)
+
+		return
+	}
+	agent.ReportDtlsPacket(packet)
+}
+
+// SetDtlsHandshakeComplete records the negotiated role/version in ICE's SPED controller.
+func (t *ICETransport) SetDtlsHandshakeComplete(isClient bool, version protocol.Version) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.stopped || t.gatherer == nil {
+		return
+	}
+	if agent := t.gatherer.getAgent(); agent != nil {
+		agent.SetDtlsHandshakeComplete(isClient, version)
+	}
+}
+
+func (t *ICETransport) setDtlsFailed() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.stopped || t.gatherer == nil {
+		return
+	}
+	if agent := t.gatherer.getAgent(); agent != nil {
+		agent.SetDtlsFailed()
+	}
 }

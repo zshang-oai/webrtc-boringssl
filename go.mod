@@ -2,6 +2,8 @@ module github.com/pion/webrtc/v4
 
 go 1.24.0
 
+replace github.com/pion/ice/v4 => github.com/zshang-oai/ice/v4 v4.0.0-20260918155337-be297e4b31f6
+
 require (
 	github.com/pion/datachannel v1.6.3
 	github.com/pion/dtls/v3 v3.1.9
@@ -15,7 +17,7 @@ require (
 	github.com/pion/sdp/v3 v3.0.20
 	github.com/pion/srtp/v3 v3.0.16
 	github.com/pion/stun/v4 v4.0.1
-	github.com/pion/transport/v5 v5.0.0
+	github.com/pion/transport/v5 v5.0.1
 	github.com/pion/turn/v5 v5.1.2
 	github.com/sclevine/agouti v3.0.0+incompatible
 	github.com/stretchr/testify v1.12.1

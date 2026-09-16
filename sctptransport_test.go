@@ -180,6 +180,24 @@ func TestSCTPTransport_sctpClientOptions_IncludesOptionalOptions(t *testing.T) {
 	}
 }
 
+func TestSCTPTransport_GetSctpInit_UsesSeededLocalInit(t *testing.T) {
+	seed := []byte("decoded-sctp-init")
+	settingEngine := SettingEngine{}
+	settingEngine.SetSctpSnapLocalInit(seed)
+
+	api := NewAPI(WithSettingEngine(settingEngine))
+	transport := api.NewSCTPTransport(nil)
+
+	require.Equal(t, seed, transport.localSctpInit)
+	api.settingEngine.sctp.snapLocalInit[0] = 'x'
+
+	transport.lock.Lock()
+	actual := transport.GetSctpInit()
+	transport.lock.Unlock()
+
+	assert.Equal(t, seed, actual)
+}
+
 func TestSCTPTransportOnClose(t *testing.T) {
 	offerPC, answerPC, err := newPair()
 	require.NoError(t, err)

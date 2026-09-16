@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/fingerprint"
+	"github.com/pion/dtls/v3/pkg/protocol"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
@@ -86,6 +88,13 @@ func (r *srtpRTPReader) Read(in []byte, a interceptor.Attributes) (int, intercep
 type dtlsHandshaker interface {
 	Handshake() error
 	HandshakeContext(context.Context) error
+}
+
+type dtlsPacketHookConn interface {
+	DTLSConn
+	InjectInboundPacket(packet []byte, rAddr net.Addr) error
+	SetOutboundHandshakePacketInterceptor(func(datagrams [][]byte, rAddr net.Addr) bool)
+	SetInboundHandshakePacketNotifier(func(packet []byte))
 }
 
 // dtlsCloseNotifyHandlerSetter is implemented by DTLS connections that need
@@ -353,6 +362,7 @@ func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(dt
 
 	dtlsConn, err := t.connectDTLS(dtlsEndpoint, role, sharedOpts, certificate)
 	if err != nil {
+		t.abortSPED(nil)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsEndpoint.Close()
 
@@ -362,7 +372,16 @@ func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(dt
 		closeNotifyConn.setCloseNotifyHandler(t.internalOnCloseHandler)
 	}
 
+	if err = t.configureSPED(dtlsConn); err != nil {
+		t.abortSPED(dtlsConn)
+		dtlsEndpoint.SetOnClose(nil)
+		_ = dtlsConn.Close()
+
+		return t.failStart(err)
+	}
+
 	if err = handshake(dtlsConn); err != nil {
+		t.abortSPED(dtlsConn)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsConn.Close()
 
@@ -370,6 +389,7 @@ func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(dt
 	}
 
 	if err = t.completeStart(dtlsConn); err != nil {
+		t.abortSPED(dtlsConn)
 		dtlsEndpoint.SetOnClose(nil)
 		_ = dtlsConn.Close()
 
@@ -377,6 +397,93 @@ func (t *DTLSTransport) start(remoteParameters DTLSParameters, handshake func(dt
 	}
 
 	return nil
+}
+
+func (t *DTLSTransport) configureSPED(dtlsConn DTLSConn) error {
+	if !t.api.settingEngine.enableSped {
+		return nil
+	}
+
+	hookConn, ok := dtlsConn.(dtlsPacketHookConn)
+	if !ok {
+		return errors.New("sped requires a DTLS connection with packet hooks")
+	}
+	if _, ok := dtlsConn.(dtlsVersionConn); !ok {
+		return errors.New("sped requires a DTLS connection that reports the negotiated version")
+	}
+
+	hookConn.SetOutboundHandshakePacketInterceptor(func(datagrams [][]byte, rAddr net.Addr) bool {
+		return t.iceTransport.Piggyback(datagrams, rAddr)
+	})
+	hookConn.SetInboundHandshakePacketNotifier(func(packet []byte) {
+		t.iceTransport.ReportDtlsPacket(packet)
+	})
+	t.iceTransport.SetDtlsCallback(func(packet []byte, rAddr net.Addr) {
+		if err := hookConn.InjectInboundPacket(packet, rAddr); err != nil {
+			t.log.Warnf("failed to inject SPED DTLS packet: %s", err)
+		}
+	})
+
+	return nil
+}
+
+func (t *DTLSTransport) finishSPED(dtlsConn DTLSConn) {
+	if !t.api.settingEngine.enableSped {
+		return
+	}
+
+	versionConn, ok := dtlsConn.(dtlsVersionConn)
+	if !ok {
+		return // configureSPED rejects a factory without the version capability.
+	}
+	t.iceTransport.SetDtlsHandshakeComplete(t.role() == DTLSRoleClient, versionConn.DTLSVersion())
+	if t.shouldClearSPEDFinalFlight(dtlsConn) {
+		t.clearSPED(dtlsConn)
+	}
+}
+
+func (t *DTLSTransport) abortSPED(dtlsConn DTLSConn) {
+	if !t.api.settingEngine.enableSped {
+		return
+	}
+	t.iceTransport.setDtlsFailed()
+	t.clearSPED(dtlsConn)
+}
+
+func (t *DTLSTransport) clearSPED(dtlsConn DTLSConn) {
+	if !t.api.settingEngine.enableSped {
+		return
+	}
+
+	t.iceTransport.SetDtlsCallback(nil)
+	if hookConn, ok := dtlsConn.(dtlsPacketHookConn); ok {
+		hookConn.SetOutboundHandshakePacketInterceptor(nil)
+		hookConn.SetInboundHandshakePacketNotifier(nil)
+	}
+}
+
+type dtlsVersionConn interface {
+	DTLSVersion() protocol.Version
+}
+
+func (t *DTLSTransport) shouldClearSPEDFinalFlight(dtlsConn DTLSConn) bool {
+	versionConn, ok := dtlsConn.(dtlsVersionConn)
+	if !ok {
+		return true
+	}
+
+	return shouldClearSPEDFinalFlight(t.role(), versionConn.DTLSVersion() == protocol.Version1_3)
+}
+
+func shouldClearSPEDFinalFlight(role DTLSRole, isDTLS13 bool) bool {
+	switch role {
+	case DTLSRoleClient:
+		return !isDTLS13
+	case DTLSRoleServer:
+		return isDTLS13
+	default:
+		return true
+	}
 }
 
 func (t *DTLSTransport) prepareStart(remoteParameters DTLSParameters) (DTLSRole, tls.Certificate, error) {
@@ -655,6 +762,9 @@ func (t *DTLSTransport) completeStart(dtlsConn DTLSConn) error {
 
 	t.lock.Lock()
 	defer t.lock.Unlock()
+	if t.state == DTLSTransportStateClosed {
+		return &rtcerr.InvalidStateError{Err: errInvalidDTLSStart}
+	}
 
 	if err != nil {
 		t.onStateChange(DTLSTransportStateFailed)
@@ -665,6 +775,7 @@ func (t *DTLSTransport) completeStart(dtlsConn DTLSConn) error {
 	t.srtpProtectionProfile = srtpProtectionProfile
 	t.conn = dtlsConn
 	t.onStateChange(DTLSTransportStateConnected)
+	t.finishSPED(dtlsConn)
 
 	return t.startSRTP()
 }
@@ -672,6 +783,9 @@ func (t *DTLSTransport) completeStart(dtlsConn DTLSConn) error {
 func (t *DTLSTransport) failStart(err error) error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
+	// Handshake failure can close the underlying endpoint before it reaches
+	// this method. Preserve the failure notification even if that close has
+	// already closed the transport, as in the upstream startup contract.
 	t.onStateChange(DTLSTransportStateFailed)
 
 	return err

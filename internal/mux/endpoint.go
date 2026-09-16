@@ -55,19 +55,23 @@ func (e *Endpoint) ReadFrom(p []byte) (int, net.Addr, error) {
 	return i, nil, err
 }
 
-// Write writes len(p) bytes to the underlying conn.
+// Write submits a datagram. When ICE has no candidate pairs, the datagram is
+// discarded and reported as accepted, allowing higher protocols to recover from
+// packet loss without treating a temporary lack of connectivity as a fatal error.
 func (e *Endpoint) Write(p []byte) (int, error) {
 	n, err := e.mux.nextConn.Write(p)
-	if errors.Is(err, ice.ErrNoCandidatePairs) {
-		return 0, nil
-	} else if errors.Is(err, ice.ErrClosed) {
+	if errors.Is(err, ice.ErrClosed) {
 		return 0, io.ErrClosedPipe
+	}
+	if n == 0 && errors.Is(err, ice.ErrNoCandidatePairs) {
+		// Accept the whole datagram: (0, nil) would violate the Writer contract.
+		return len(p), nil
 	}
 
 	return n, err
 }
 
-// WriteTo writes len(p) bytes to the underlying conn.
+// WriteTo submits a datagram using the same loss policy as Write.
 func (e *Endpoint) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return e.Write(p)
 }
