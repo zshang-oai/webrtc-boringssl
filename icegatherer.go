@@ -259,6 +259,7 @@ func (g *ICEGatherer) baseAgentOptions(mDNSMode ice.MulticastDNSMode) []ice.Agen
 		ice.WithProxyDialer(g.api.settingEngine.iceProxyDialer),
 		ice.WithBindingRequestHandler(g.api.settingEngine.iceBindingRequestHandler),
 		ice.WithCandidatePairPacketHandler(g.api.settingEngine.iceCandidatePairPacketHandler),
+		ice.WithSTUNSendHandler(g.api.settingEngine.iceSTUNSendHandler),
 	}
 	return options
 }

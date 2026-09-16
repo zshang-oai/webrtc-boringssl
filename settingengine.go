@@ -111,6 +111,7 @@ type SettingEngine struct {
 	iceUseCandidateCheckPriority              bool
 	iceBindingRequestHandler                  func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool //nolint:lll
 	iceCandidatePairPacketHandler             ice.CandidatePairPacketHandler
+	iceSTUNSendHandler                        ice.STUNSendHandler
 	disableMediaEngineCopy                    bool
 	disableMediaEngineMultipleCodecs          bool
 	srtpProtectionProfiles                    []dtls.SRTPProtectionProfile
@@ -720,6 +721,19 @@ func (e *SettingEngine) SetICEBindingRequestHandler(
 	bindingRequestHandler func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool,
 ) {
 	e.iceBindingRequestHandler = bindingRequestHandler
+}
+
+// SetICESTUNSendHandler sets a callback for outbound STUN Binding success
+// responses, after the default XOR-MAPPED-ADDRESS and before SPED DATA/ACK,
+// MESSAGE-INTEGRITY, and FINGERPRINT are added. It receives the corresponding
+// authenticated request and the physical local/remote candidates. Modifying the
+// response does not change its physical destination or the candidate pair.
+//
+// The callback runs synchronously on the ICE loop. Messages are borrowed: do not
+// retain them, mutate the request or candidates, block, or call synchronous ICE
+// Agent methods. An error suppresses the response. Nil disables the callback.
+func (e *SettingEngine) SetICESTUNSendHandler(handler ice.STUNSendHandler) {
+	e.iceSTUNSendHandler = handler
 }
 
 // SetICECandidatePairPacketHandler observes non-STUN packets on a known,

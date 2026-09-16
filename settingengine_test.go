@@ -24,6 +24,20 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+func TestSettingEngine_STUNSendHandler(t *testing.T) {
+	settings := SettingEngine{}
+	assert.Nil(t, settings.iceSTUNSendHandler)
+	called := false
+	settings.SetICESTUNSendHandler(func(_, _ *stun.Message, _, _ ice.Candidate) error {
+		called = true
+		return context.Canceled
+	})
+	assert.ErrorIs(t, settings.iceSTUNSendHandler(nil, nil, nil, nil), context.Canceled)
+	assert.True(t, called)
+	settings.SetICESTUNSendHandler(nil)
+	assert.Nil(t, settings.iceSTUNSendHandler)
+}
+
 func TestSetEphemeralUDPPortRange(t *testing.T) {
 	settingEngine := SettingEngine{}
 	assert.Equal(t, uint16(0), settingEngine.ephemeralUDP.PortMin)
