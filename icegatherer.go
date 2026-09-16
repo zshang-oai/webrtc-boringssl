@@ -244,7 +244,7 @@ func (g *ICEGatherer) sanitizedMDNSMode() ice.MulticastDNSMode {
 }
 
 func (g *ICEGatherer) baseAgentOptions(mDNSMode ice.MulticastDNSMode) []ice.AgentOption {
-	return []ice.AgentOption{
+	options := []ice.AgentOption{
 		ice.WithICELite(g.api.settingEngine.candidates.ICELite),
 		ice.WithUrls(g.validatedServers),
 		ice.WithPortRange(g.api.settingEngine.ephemeralUDP.PortMin, g.api.settingEngine.ephemeralUDP.PortMax),
@@ -258,7 +258,9 @@ func (g *ICEGatherer) baseAgentOptions(mDNSMode ice.MulticastDNSMode) []ice.Agen
 		ice.WithUDPMux(g.api.settingEngine.iceUDPMux),
 		ice.WithProxyDialer(g.api.settingEngine.iceProxyDialer),
 		ice.WithBindingRequestHandler(g.api.settingEngine.iceBindingRequestHandler),
+		ice.WithCandidatePairPacketHandler(g.api.settingEngine.iceCandidatePairPacketHandler),
 	}
+	return options
 }
 
 func (g *ICEGatherer) credentialOptions() []ice.AgentOption {

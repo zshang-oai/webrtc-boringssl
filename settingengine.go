@@ -110,6 +110,7 @@ type SettingEngine struct {
 	iceDisableActiveTCP                       bool
 	iceUseCandidateCheckPriority              bool
 	iceBindingRequestHandler                  func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool //nolint:lll
+	iceCandidatePairPacketHandler             ice.CandidatePairPacketHandler
 	disableMediaEngineCopy                    bool
 	disableMediaEngineMultipleCodecs          bool
 	srtpProtectionProfiles                    []dtls.SRTPProtectionProfile
@@ -719,6 +720,18 @@ func (e *SettingEngine) SetICEBindingRequestHandler(
 	bindingRequestHandler func(m *stun.Message, local, remote ice.Candidate, pair *ice.CandidatePair) bool,
 ) {
 	e.iceBindingRequestHandler = bindingRequestHandler
+}
+
+// SetICECandidatePairPacketHandler observes non-STUN packets on a known,
+// unselected pair while another pair is selected. Returning true selects the
+// incoming pair and, for an ICE-lite agent, makes it a valid (Succeeded) pair.
+//
+// The callback runs on the serialized ICE loop. Its packet is borrowed, read-only,
+// and has not passed SRTP authentication. The application owns path approval;
+// neither a known candidate nor this callback authenticates the packet. Do not
+// retain the packet, block, or call synchronous ICE Agent methods. Nil disables it.
+func (e *SettingEngine) SetICECandidatePairPacketHandler(handler ice.CandidatePairPacketHandler) {
+	e.iceCandidatePairPacketHandler = handler
 }
 
 // SetFireOnTrackBeforeFirstRTP sets if firing the OnTrack event should happen
